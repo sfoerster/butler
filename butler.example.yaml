@@ -1,0 +1,20 @@
+# Butler configuration
+# Copy to butler.yaml and customize.
+# Supports ${ENV_VAR} interpolation for secrets.
+
+listen: "127.0.0.1:8080"
+upstream: "http://127.0.0.1:11434"
+
+clients:
+  - name: linkedin-copilot
+    key: "${LINKEDIN_COPILOT_KEY}"
+    allow_models: ["llama3.2", "mistral"]
+
+  - name: open-webui
+    key: "${OPEN_WEBUI_KEY}"
+    allow_models: ["*"]
+
+  - name: dev-sandbox
+    key: "${DEV_SANDBOX_KEY}"
+    allow_models: ["llama3.2:1b"]
+    # deny_models: ["some-model"]  # optional denylist (checked before allowlist)

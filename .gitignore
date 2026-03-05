@@ -1,0 +1,21 @@
+# Binary
+butler
+/butler
+
+# Config with secrets
+butler.yaml
+
+# Go
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

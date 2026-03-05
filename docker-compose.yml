@@ -1,0 +1,19 @@
+services:
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  butler:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./butler.yaml:/etc/butler/butler.yaml:ro
+    depends_on:
+      - ollama
+
+volumes:
+  ollama_data:

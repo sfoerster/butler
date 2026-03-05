@@ -1,0 +1,32 @@
+stages:
+  - test
+  - build
+
+variables:
+  GOPATH: ${CI_PROJECT_DIR}/.go
+
+cache:
+  paths:
+    - .go/pkg/mod/
+
+lint:
+  stage: test
+  image: golangci/golangci-lint:v2.1
+  script:
+    - golangci-lint run ./...
+
+test:
+  stage: test
+  image: golang:1.23-alpine
+  script:
+    - go test -race -cover ./...
+
+build:
+  stage: build
+  image: golang:1.23-alpine
+  script:
+    - CGO_ENABLED=0 go build -ldflags="-s -w" -o butler ./cmd/butler
+  artifacts:
+    paths:
+      - butler
+    expire_in: 1 week
