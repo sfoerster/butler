@@ -1,4 +1,4 @@
-module github.com/sfoerster-dev/butler
+module gitlab.com/sfoerster/butler
 
 go 1.23
 
