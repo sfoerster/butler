@@ -181,6 +181,10 @@ func TestLoadValidation(t *testing.T) {
 		yaml string
 	}{
 		{"missing upstream", `clients: [{name: a, key: k, allow_models: ["*"]}]`},
+		{"upstream missing scheme", `upstream: "localhost:11434"
+clients: [{name: a, key: k, allow_models: ["*"]}]`},
+		{"unsupported upstream scheme", `upstream: "ftp://localhost:11434"
+clients: [{name: a, key: k, allow_models: ["*"]}]`},
 		{"no clients", `upstream: "http://localhost:11434"`},
 		{"missing client name", `upstream: "http://localhost:11434"
 clients: [{key: k, allow_models: ["*"]}]`},

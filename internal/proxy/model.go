@@ -2,9 +2,14 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 )
+
+var errBodyTooLarge = errors.New("request body too large")
+
+const maxModelInspectBodyBytes = 8 << 20 // 8 MiB
 
 // modelBearingPaths are URL paths that carry a model name in the request body.
 var modelBearingPaths = map[string]bool{
@@ -35,11 +40,15 @@ func extractModel(r *http.Request) (string, []byte, error) {
 		return "", nil, nil
 	}
 
-	body, err := io.ReadAll(r.Body)
+	limited := io.LimitReader(r.Body, maxModelInspectBodyBytes+1)
+	body, err := io.ReadAll(limited)
 	if err != nil {
 		return "", nil, err
 	}
 	_ = r.Body.Close()
+	if len(body) > maxModelInspectBodyBytes {
+		return "", nil, errBodyTooLarge
+	}
 
 	var payload struct {
 		Model string `json:"model"`

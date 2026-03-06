@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"gitlab.com/sfoerster/butler/internal/config"
 	"gitlab.com/sfoerster/butler/internal/proxy"
@@ -37,7 +38,15 @@ func main() {
 	}
 
 	logger.Info("starting butler", "listen", cfg.Listen)
-	if err := http.ListenAndServe(cfg.Listen, p); err != nil {
+	server := &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           p,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
+	}
+	if err := server.ListenAndServe(); err != nil {
 		logger.Error("server error", "error", err)
 		os.Exit(1)
 	}

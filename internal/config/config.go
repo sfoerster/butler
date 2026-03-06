@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -48,6 +49,16 @@ func (c *Config) validate() error {
 	}
 	if c.Upstream == "" {
 		return fmt.Errorf("upstream is required")
+	}
+	upstreamURL, err := url.Parse(c.Upstream)
+	if err != nil {
+		return fmt.Errorf("upstream must be a valid URL: %w", err)
+	}
+	if upstreamURL.Scheme == "" || upstreamURL.Host == "" {
+		return fmt.Errorf("upstream must include scheme and host")
+	}
+	if upstreamURL.Scheme != "http" && upstreamURL.Scheme != "https" {
+		return fmt.Errorf("upstream scheme must be http or https")
 	}
 	if len(c.Clients) == 0 {
 		return fmt.Errorf("at least one client must be configured")

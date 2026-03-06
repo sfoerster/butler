@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -35,6 +36,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(upstream)
 			r.Out.Host = upstream.Host
+			r.Out.Header.Del("Authorization")
+			r.Out.Header.Del("Proxy-Authorization")
 		},
 		FlushInterval: -1, // flush immediately for streaming
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -63,11 +66,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Extract model from request body (if applicable)
 	model, body, err := extractModel(r)
 	if err != nil {
+		status := http.StatusBadRequest
+		resp := `{"error":"bad request"}`
+		if errors.Is(err, errBodyTooLarge) {
+			status = http.StatusRequestEntityTooLarge
+			resp = `{"error":"request body too large"}`
+		}
 		p.logger.Error("failed to read request body",
 			"error", err,
 			"client", client.Name,
 		)
-		writeJSON(w, http.StatusBadRequest, `{"error":"bad request"}`)
+		writeJSON(w, status, resp)
 		return
 	}
 
@@ -110,11 +119,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) authenticate(r *http.Request) *config.Client {
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	scheme, token, ok := strings.Cut(auth, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
 		return nil
 	}
-	key := strings.TrimPrefix(auth, "Bearer ")
+	key := strings.TrimSpace(token)
+	if key == "" {
+		return nil
+	}
 	return p.config.ClientByKey(key)
 }
 

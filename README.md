@@ -150,6 +150,7 @@ All errors are returned as JSON:
 | `401` | `{"error":"unauthorized"}` | Missing or invalid API key |
 | `403` | `{"error":"model not allowed"}` | Client not authorized for the requested model |
 | `400` | `{"error":"bad request"}` | Malformed request body |
+| `413` | `{"error":"request body too large"}` | Model-bearing request body exceeds inspection limit |
 | `502` | `{"error":"upstream unavailable"}` | Cannot reach Ollama |
 
 ### Supported endpoints

@@ -337,6 +337,45 @@ func TestNonBearerAuthRejected(t *testing.T) {
 	}
 }
 
+func TestBearerAuthCaseInsensitive(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"models":[]}`))
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream)
+
+	for _, auth := range []string{"bearer sk-admin", "BEARER sk-admin", "BeArEr sk-admin"} {
+		t.Run(auth, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest("GET", "/api/tags", nil)
+			r.Header.Set("Authorization", auth)
+			p.ServeHTTP(w, r)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("Authorization %q: status = %d, want %d", auth, w.Code, http.StatusOK)
+			}
+		})
+	}
+}
+
+func TestEmptyBearerTokenRejected(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be reached")
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer ")
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
 func TestDenylistThroughProxy(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("upstream should not be reached for denied model")
@@ -451,7 +490,7 @@ func TestUpstreamErrorForwarded(t *testing.T) {
 	}
 }
 
-func TestAuthHeaderForwardedToUpstream(t *testing.T) {
+func TestAuthHeaderStrippedFromUpstream(t *testing.T) {
 	var gotAuth string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
@@ -465,8 +504,33 @@ func TestAuthHeaderForwardedToUpstream(t *testing.T) {
 	r.Header.Set("Authorization", "Bearer sk-admin")
 	p.ServeHTTP(w, r)
 
-	if gotAuth != "Bearer sk-admin" {
-		t.Errorf("upstream Authorization = %q, want %q", gotAuth, "Bearer sk-admin")
+	if gotAuth != "" {
+		t.Errorf("upstream Authorization = %q, want empty header", gotAuth)
+	}
+}
+
+func TestModelEndpointRejectsOversizedBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be reached for oversized body")
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream)
+	body := `{"model":"llama3.2","prompt":"` + strings.Repeat("a", maxModelInspectBodyBytes) + `"}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/generate", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer sk-allowed")
+	r.Header.Set("Content-Type", "application/json")
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusRequestEntityTooLarge)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != `{"error":"request body too large"}` {
+		t.Errorf("body = %q, want request-body-too-large error", got)
 	}
 }
 
