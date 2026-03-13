@@ -87,14 +87,14 @@ The MVP uses per-service API keys. This phase adds per-user identity so multiple
 
 **Authentication**
 
-Two modes: standalone (built-in user management) or federated (delegate to an external OIDC provider like Vinsium's Keycloak).
+Two modes: standalone (built-in user management) or federated (delegate to an external OIDC provider like Keycloak, Okta, or Entra ID).
 
 - [ ] JWT authentication — proxy validates JWTs (HS256/RS256) in `Authorization: Bearer <token>` header
 - [ ] **Standalone mode**: built-in `/auth/login` endpoint — accepts username/password, returns a signed JWT (users defined in config)
 - [ ] **OIDC mode**: proxy acts as an OIDC relying party — validates tokens issued by an external provider (Keycloak, Okta, Entra ID, etc.) using JWKS discovery
 - [ ] OIDC auto-discovery via `/.well-known/openid-configuration` from the issuer URL
-- [ ] Role-to-policy mapping — map OIDC roles/groups from JWT claims to proxy policy (e.g., Vinsium `admin` → all models, `viewer` → restricted models)
-- [ ] Configurable role claim path (`realm_access.roles` for Keycloak, `groups` for Okta, etc.) — same approach Vinsium uses
+- [ ] Role-to-policy mapping — map OIDC roles/groups from JWT claims to proxy policy (e.g., `admin` → all models, `viewer` → restricted models)
+- [ ] Configurable role claim path (`realm_access.roles` for Keycloak, `groups` for Okta, etc.)
 - [ ] JWT claims carry user identity (`sub`), allowed models, rate-limit tier, and expiry
 - [ ] API keys (Phase 1) remain supported — a key can optionally be scoped to a user identity
 - [ ] Configurable auth mode per-listener: `api_key`, `jwt_standalone`, `oidc`, or `either`
@@ -144,7 +144,7 @@ clients:
     allow_models: ["llama3.2", "mistral"]
 ```
 
-**Example config — OIDC mode (federated via Vinsium/Keycloak):**
+**Example config — OIDC mode (federated via Keycloak):**
 
 ```yaml
 listen: "0.0.0.0:8080"
@@ -153,12 +153,12 @@ upstream: "http://127.0.0.1:11434"
 auth:
   mode: oidc
   oidc:
-    issuer: "https://id.vinsium.local/realms/vinsium"
+    issuer: "https://auth.example.com/realms/default"
     client_id: "butler"
     # JWKS fetched automatically via .well-known/openid-configuration
     role_claim_path: "realm_access.roles"   # Keycloak default
 
-# Map OIDC roles to proxy policy — users are managed in Keycloak, not here
+# Map OIDC roles to proxy policy — users are managed in the IdP, not here
 role_policies:
   admin:
     allow_models: ["*"]
@@ -201,7 +201,7 @@ clients:
 
 - **Language**: Go — single binary, stdlib `net/http/httputil.ReverseProxy` gets the MVP proxy running fast, same language as Ollama itself
 - **Repo**: `github.com/sfoerster/butler` — standalone, independent release cycle
-- **License**: Apache 2.0 (open-core base); Vinsium integration and enterprise features under proprietary license
+- **License**: Apache 2.0
 - **Config**: YAML with env var interpolation (`${VAR}` syntax) — keys can be inline for dev or env-referenced for production. Mounted as a Docker volume.
 - **Logging**: JSON lines to stdout (12-factor style, pipe to whatever you want)
 - **Deployment**: Docker-first
@@ -235,7 +235,7 @@ clients:
 | Auth (SSO/OIDC) | Paid enterprise license | Built-in, open-core |
 | Compliance | Basic logging | Audit trail, SBOM, FIPS-capable |
 | Deployment | Multi-container stack | Single container |
-| Vinsium integration | None | Native OIDC federation, shared identity |
+| OIDC integration | None (paid enterprise) | Built-in, open-core |
 
 **Positioning: "LiteLLM is for teams routing to cloud APIs. Butler is for teams running their own models."**
 
@@ -261,7 +261,7 @@ A key insight: most Ollama clients are **stateless at the protocol level**. Olla
 3. **Audit** — logging requests with user identity so prompts don't get mixed in logs
 4. **Edge cases** — the `/api/generate` endpoint's `context` continuation blob is the one piece of opaque state that could theoretically leak between users if a client misbehaves
 
-For client apps like linkedin-copilot (a Chrome extension), each user already has fully isolated state in their own browser profile. The proxy just needs to authenticate them and enforce limits — it doesn't need to store or manage their conversation context.
+For client apps like browser extensions, each user already has fully isolated state in their own browser profile. The proxy just needs to authenticate them and enforce limits — it doesn't need to store or manage their conversation context.
 
 For shared server-side apps (e.g., a single Open WebUI instance used by the family), the proxy injects user identity via `X-Butler-User` and the app is responsible for partitioning its own database. The proxy can additionally require dual auth (`require_user_jwt: true`) — both the service API key and a user JWT must be present.
 
