@@ -17,6 +17,3 @@ linters:
       rules:
         - name: exported
           disabled: true
-
-issues:
-  exclude-default-patterns: false
