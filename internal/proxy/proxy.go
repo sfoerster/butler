@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"gitlab.com/sfoerster/butler/internal/config"
+	"github.com/sfoerster/butler/internal/config"
 )
 
 type Proxy struct {

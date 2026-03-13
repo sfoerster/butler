@@ -7,8 +7,8 @@ import (
 	"os"
 	"time"
 
-	"gitlab.com/sfoerster/butler/internal/config"
-	"gitlab.com/sfoerster/butler/internal/proxy"
+	"github.com/sfoerster/butler/internal/config"
+	"github.com/sfoerster/butler/internal/proxy"
 )
 
 func main() {

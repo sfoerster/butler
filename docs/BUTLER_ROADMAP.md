@@ -200,7 +200,7 @@ clients:
 ## Tech Choices
 
 - **Language**: Go — single binary, stdlib `net/http/httputil.ReverseProxy` gets the MVP proxy running fast, same language as Ollama itself
-- **Repo**: `gitlab.com/sfoerster/butler` — standalone, independent release cycle
+- **Repo**: `github.com/sfoerster/butler` — standalone, independent release cycle
 - **License**: Apache 2.0 (open-core base); Vinsium integration and enterprise features under proprietary license
 - **Config**: YAML with env var interpolation (`${VAR}` syntax) — keys can be inline for dev or env-referenced for production. Mounted as a Docker volume.
 - **Logging**: JSON lines to stdout (12-factor style, pipe to whatever you want)

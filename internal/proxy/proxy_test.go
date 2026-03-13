@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.com/sfoerster/butler/internal/config"
+	"github.com/sfoerster/butler/internal/config"
 )
 
 func newTestProxy(t *testing.T, upstream *httptest.Server) *Proxy {
