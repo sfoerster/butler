@@ -18,12 +18,14 @@ You should receive an acknowledgment within 72 hours. Please allow reasonable ti
 Security-sensitive components include:
 
 1. **Authentication and API key handling** -- key validation, constant-time comparison, and rejection of unauthenticated requests (`internal/proxy/proxy.go`).
-2. **Model ACL enforcement** -- allowlist/denylist evaluation and deny-by-default logic (`internal/config/config.go`).
-3. **Request body inspection** -- model name extraction, prompt collection, and parameter parsing from incoming request bodies (`internal/proxy/model.go`).
-4. **Input filtering** -- regex-based prompt rejection, context length and token caps, and request size limits (`internal/proxy/proxy.go`, `internal/config/config.go`).
-5. **Rate limiting** -- per-client and global fixed-window rate limiting (`internal/proxy/ratelimit.go`).
-6. **Reverse proxy transport** -- upstream request forwarding, header handling, and response streaming (`internal/proxy/proxy.go`).
-7. **Configuration loading** -- YAML parsing and `${ENV_VAR}` interpolation of secrets (`internal/config/config.go`).
+2. **JWT token handling** -- HMAC-based JWT issuance, validation, and expiration enforcement (`internal/auth/jwt.go`).
+3. **OIDC federation** -- OIDC discovery, JWKS fetching/caching, asymmetric token signature validation, issuer/audience verification, role extraction (`internal/auth/oidc.go`).
+4. **Model ACL enforcement** -- allowlist/denylist evaluation, deny-by-default logic, and multi-role policy merging (`internal/config/config.go`).
+5. **Request body inspection** -- model name extraction, prompt collection, and parameter parsing from incoming request bodies (`internal/proxy/model.go`).
+6. **Input filtering** -- regex-based prompt rejection, context length and token caps, and request size limits (`internal/proxy/proxy.go`, `internal/config/config.go`).
+7. **Rate limiting** -- per-client, per-user, and global fixed-window rate limiting (`internal/proxy/ratelimit.go`).
+8. **Reverse proxy transport** -- upstream request forwarding, header handling, and response streaming (`internal/proxy/proxy.go`).
+9. **Configuration loading** -- YAML parsing and `${ENV_VAR}` interpolation of secrets (`internal/config/config.go`).
 
 ## Unauthenticated Endpoints
 
