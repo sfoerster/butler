@@ -748,3 +748,408 @@ func TestClientByKey(t *testing.T) {
 		t.Error("expected nil for unknown key")
 	}
 }
+
+func TestLoadOIDCMode(t *testing.T) {
+	yaml := `
+upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "https://auth.example.com/realms/default"
+    client_id: "butler"
+    role_claim_path: "realm_access.roles"
+    refresh_interval: "30m"
+role_policies:
+  admin:
+    allow_models: ["*"]
+  viewer:
+    allow_models: ["llama3.2:1b"]
+    rate_limit: "20/hour"
+    max_ctx: 2048
+`
+	path := filepath.Join(t.TempDir(), "butler.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Auth.Mode != "oidc" {
+		t.Errorf("Auth.Mode = %q, want %q", cfg.Auth.Mode, "oidc")
+	}
+	if cfg.Auth.OIDC.Issuer != "https://auth.example.com/realms/default" {
+		t.Errorf("OIDC.Issuer = %q", cfg.Auth.OIDC.Issuer)
+	}
+	if cfg.Auth.OIDC.ClientID != "butler" {
+		t.Errorf("OIDC.ClientID = %q", cfg.Auth.OIDC.ClientID)
+	}
+	if cfg.Auth.OIDC.RoleClaimPath != "realm_access.roles" {
+		t.Errorf("OIDC.RoleClaimPath = %q", cfg.Auth.OIDC.RoleClaimPath)
+	}
+	if cfg.Auth.OIDC.RefreshIntervalDuration() != 30*time.Minute {
+		t.Errorf("RefreshInterval = %v, want 30m", cfg.Auth.OIDC.RefreshIntervalDuration())
+	}
+	if len(cfg.RolePolicies) != 2 {
+		t.Fatalf("len(RolePolicies) = %d, want 2", len(cfg.RolePolicies))
+	}
+	admin := cfg.RolePolicies["admin"]
+	if len(admin.AllowModels) != 1 || admin.AllowModels[0] != "*" {
+		t.Errorf("admin AllowModels = %v", admin.AllowModels)
+	}
+	viewer := cfg.RolePolicies["viewer"]
+	if viewer.rate == nil || viewer.rate.Count != 20 {
+		t.Errorf("viewer rate = %+v", viewer.rate)
+	}
+	if viewer.MaxCtx != 2048 {
+		t.Errorf("viewer MaxCtx = %d", viewer.MaxCtx)
+	}
+}
+
+func TestLoadOIDCValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{"missing issuer", `upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    client_id: "butler"
+    role_claim_path: "roles"
+role_policies:
+  admin:
+    allow_models: ["*"]`},
+		{"non-HTTPS issuer", `upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "http://auth.example.com"
+    client_id: "butler"
+    role_claim_path: "roles"
+role_policies:
+  admin:
+    allow_models: ["*"]`},
+		{"missing client_id", `upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "https://auth.example.com"
+    role_claim_path: "roles"
+role_policies:
+  admin:
+    allow_models: ["*"]`},
+		{"missing role_claim_path", `upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "https://auth.example.com"
+    client_id: "butler"
+role_policies:
+  admin:
+    allow_models: ["*"]`},
+		{"no role_policies", `upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "https://auth.example.com"
+    client_id: "butler"
+    role_claim_path: "roles"`},
+		{"bad refresh_interval", `upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "https://auth.example.com"
+    client_id: "butler"
+    role_claim_path: "roles"
+    refresh_interval: "bad"
+role_policies:
+  admin:
+    allow_models: ["*"]`},
+		{"negative refresh_interval", `upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "https://auth.example.com"
+    client_id: "butler"
+    role_claim_path: "roles"
+    refresh_interval: "-1m"
+role_policies:
+  admin:
+    allow_models: ["*"]`},
+		{"missing oidc config", `upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+role_policies:
+  admin:
+    allow_models: ["*"]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "butler.yaml")
+			if err := os.WriteFile(path, []byte(tt.yaml), 0644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestLoadEitherModeWithOIDC(t *testing.T) {
+	yaml := `
+upstream: "http://localhost:11434"
+auth:
+  mode: either
+  oidc:
+    issuer: "https://auth.example.com/realms/default"
+    client_id: "butler"
+    role_claim_path: "realm_access.roles"
+clients:
+  - name: svc
+    key: "sk-svc"
+    allow_models: ["*"]
+role_policies:
+  admin:
+    allow_models: ["*"]
+`
+	path := filepath.Join(t.TempDir(), "butler.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Auth.Mode != "either" {
+		t.Errorf("Auth.Mode = %q, want either", cfg.Auth.Mode)
+	}
+	if cfg.Auth.OIDC == nil {
+		t.Fatal("OIDC config should be present")
+	}
+	if cfg.Auth.JWTSecret != "" {
+		// No jwt_secret required when only OIDC + API keys
+	}
+}
+
+func TestRolePolicyValidation(t *testing.T) {
+	base := func(policy string) string {
+		return `upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "https://auth.example.com"
+    client_id: "butler"
+    role_claim_path: "roles"
+role_policies:
+` + policy
+	}
+
+	tests := []struct {
+		name   string
+		policy string
+	}{
+		{"bad rate_limit", `  admin:
+    allow_models: ["*"]
+    rate_limit: "bad"`},
+		{"negative max_request_bytes", `  admin:
+    allow_models: ["*"]
+    max_request_bytes: -1`},
+		{"negative max_ctx", `  admin:
+    allow_models: ["*"]
+    max_ctx: -1`},
+		{"negative max_predict", `  admin:
+    allow_models: ["*"]
+    max_predict: -1`},
+		{"bad regex in deny_prompt_patterns", `  admin:
+    allow_models: ["*"]
+    deny_prompt_patterns: ["[invalid"]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "butler.yaml")
+			if err := os.WriteFile(path, []byte(base(tt.policy)), 0644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestRolePolicyUnlimited(t *testing.T) {
+	yaml := `
+upstream: "http://localhost:11434"
+auth:
+  mode: oidc
+  oidc:
+    issuer: "https://auth.example.com"
+    client_id: "butler"
+    role_claim_path: "roles"
+role_policies:
+  admin:
+    allow_models: ["*"]
+    rate_limit: "unlimited"
+`
+	path := filepath.Join(t.TempDir(), "butler.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	admin := cfg.RolePolicies["admin"]
+	if !admin.unlimited {
+		t.Error("admin should be unlimited")
+	}
+	if admin.rate != nil {
+		t.Error("admin rate should be nil for unlimited")
+	}
+}
+
+func TestSubjectFromRolesSingle(t *testing.T) {
+	cfg := &Config{
+		RolePolicies: map[string]RolePolicy{
+			"viewer": {
+				AllowModels: []string{"llama3.2:1b"},
+				rate:        &RateSpec{Count: 20, Window: time.Hour},
+				MaxCtx:      2048,
+				MaxPredict:  256,
+			},
+		},
+	}
+
+	subj := cfg.SubjectFromRoles("alice", []string{"viewer"})
+	if subj == nil {
+		t.Fatal("expected non-nil subject")
+	}
+	if subj.Name != "alice" {
+		t.Errorf("Name = %q", subj.Name)
+	}
+	if subj.AuthSource != "oidc" {
+		t.Errorf("AuthSource = %q", subj.AuthSource)
+	}
+	if len(subj.AllowModels) != 1 || subj.AllowModels[0] != "llama3.2:1b" {
+		t.Errorf("AllowModels = %v", subj.AllowModels)
+	}
+	if subj.Rate == nil || subj.Rate.Count != 20 {
+		t.Errorf("Rate = %+v", subj.Rate)
+	}
+	if subj.MaxCtx != 2048 {
+		t.Errorf("MaxCtx = %d", subj.MaxCtx)
+	}
+	if subj.MaxPredict != 256 {
+		t.Errorf("MaxPredict = %d", subj.MaxPredict)
+	}
+}
+
+func TestSubjectFromRolesMultiple(t *testing.T) {
+	cfg := &Config{
+		RolePolicies: map[string]RolePolicy{
+			"viewer": {
+				AllowModels: []string{"llama3.2:1b"},
+				rate:        &RateSpec{Count: 20, Window: time.Hour},
+				MaxCtx:      2048,
+			},
+			"operator": {
+				AllowModels: []string{"llama3.2", "mistral"},
+				rate:        &RateSpec{Count: 120, Window: time.Hour},
+				MaxCtx:      4096,
+			},
+		},
+	}
+
+	subj := cfg.SubjectFromRoles("bob", []string{"viewer", "operator"})
+	if subj == nil {
+		t.Fatal("expected non-nil subject")
+	}
+
+	// AllowModels should be union
+	allowMap := make(map[string]bool)
+	for _, m := range subj.AllowModels {
+		allowMap[m] = true
+	}
+	if !allowMap["llama3.2:1b"] || !allowMap["llama3.2"] || !allowMap["mistral"] {
+		t.Errorf("AllowModels union = %v", subj.AllowModels)
+	}
+
+	// Rate should be most permissive (120/hour > 20/hour)
+	if subj.Rate == nil || subj.Rate.Count != 120 {
+		t.Errorf("Rate = %+v, want 120/hour", subj.Rate)
+	}
+
+	// MaxCtx should be most permissive (4096 > 2048)
+	if subj.MaxCtx != 4096 {
+		t.Errorf("MaxCtx = %d, want 4096", subj.MaxCtx)
+	}
+
+	// DenyModels/DenyPatterns should be empty (multi-role)
+	if len(subj.DenyModels) != 0 {
+		t.Errorf("DenyModels should be empty for multi-role, got %v", subj.DenyModels)
+	}
+}
+
+func TestSubjectFromRolesUnlimited(t *testing.T) {
+	cfg := &Config{
+		RolePolicies: map[string]RolePolicy{
+			"viewer": {
+				AllowModels: []string{"llama3.2"},
+				rate:        &RateSpec{Count: 20, Window: time.Hour},
+			},
+			"admin": {
+				AllowModels: []string{"*"},
+				unlimited:   true,
+			},
+		},
+	}
+
+	subj := cfg.SubjectFromRoles("charlie", []string{"viewer", "admin"})
+	if subj == nil {
+		t.Fatal("expected non-nil subject")
+	}
+
+	// Wildcard should win
+	if len(subj.AllowModels) != 1 || subj.AllowModels[0] != "*" {
+		t.Errorf("AllowModels = %v, want [*]", subj.AllowModels)
+	}
+
+	// Unlimited rate should win (nil)
+	if subj.Rate != nil {
+		t.Errorf("Rate = %+v, want nil (unlimited)", subj.Rate)
+	}
+}
+
+func TestSubjectFromRolesNoMatch(t *testing.T) {
+	cfg := &Config{
+		RolePolicies: map[string]RolePolicy{
+			"admin": {
+				AllowModels: []string{"*"},
+			},
+		},
+	}
+
+	subj := cfg.SubjectFromRoles("nobody", []string{"nonexistent", "other"})
+	if subj != nil {
+		t.Errorf("expected nil, got %+v", subj)
+	}
+}
+
+func TestOIDCRefreshIntervalDefault(t *testing.T) {
+	oidc := &OIDCConfig{}
+	if oidc.RefreshIntervalDuration() != 60*time.Minute {
+		t.Errorf("default RefreshInterval = %v, want 60m", oidc.RefreshIntervalDuration())
+	}
+}

@@ -91,11 +91,11 @@ Two modes: standalone (built-in user management) or federated (delegate to an ex
 
 - [x] JWT authentication — proxy validates JWTs (HS256) in `Authorization: Bearer <token>` header
 - [x] **Standalone mode**: built-in `/auth/login` endpoint — accepts username/password, returns a signed JWT (users defined in config)
-- [ ] **OIDC mode**: proxy acts as an OIDC relying party — validates tokens issued by an external provider (Keycloak, Okta, Entra ID, etc.) using JWKS discovery
-- [ ] OIDC auto-discovery via `/.well-known/openid-configuration` from the issuer URL
-- [ ] Role-to-policy mapping — map OIDC roles/groups from JWT claims to proxy policy (e.g., `admin` → all models, `viewer` → restricted models)
-- [ ] Configurable role claim path (`realm_access.roles` for Keycloak, `groups` for Okta, etc.)
-- [ ] JWT claims carry user identity (`sub`), allowed models, rate-limit tier, and expiry
+- [x] **OIDC mode**: proxy acts as an OIDC relying party — validates tokens issued by an external provider (Keycloak, Okta, Entra ID, etc.) using JWKS discovery
+- [x] OIDC auto-discovery via `/.well-known/openid-configuration` from the issuer URL
+- [x] Role-to-policy mapping — map OIDC roles/groups from JWT claims to proxy policy (e.g., `admin` → all models, `viewer` → restricted models)
+- [x] Configurable role claim path (`realm_access.roles` for Keycloak, `groups` for Okta, etc.)
+- [x] JWT claims carry user identity (`sub`), allowed models, rate-limit tier, and expiry
 - [x] API keys (Phase 1) remain supported — a key can optionally be scoped to a user identity
 - [x] Configurable auth mode per-listener: `api_key`, `jwt_standalone`, or `either`
 

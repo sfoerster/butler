@@ -33,6 +33,17 @@ The `/healthz`, `/metrics`, and `/auth/login` endpoints do not require authentic
 
 When using `jwt_standalone` or `either` auth mode, the `jwt_secret` must be at least 32 characters. Use a cryptographically random string. Load it via environment variable interpolation (`${JWT_SECRET}`), not hardcoded in config files.
 
+## OIDC Security
+
+When using `oidc` or `either` auth mode with OIDC federation:
+
+1. The `oidc.issuer` must use HTTPS. HTTP issuers are rejected at config validation time.
+2. JWKS keys are fetched on startup (fail closed if the provider is unreachable) and refreshed on a configurable interval (default 60 minutes).
+3. On unknown `kid` (key rotation), Butler triggers an immediate JWKS refresh, rate-limited to once per 30 seconds to prevent abuse.
+4. If a background JWKS refresh fails, Butler continues using cached keys and logs a warning. This prevents transient provider outages from breaking authentication.
+5. HMAC (`HS256`) and `none` signing algorithms are rejected — only asymmetric algorithms (RSA, ECDSA) are accepted for OIDC tokens.
+6. Issuer (`iss`) and audience (`aud`) claims are validated against the configured values. Token expiration (`exp`) is required.
+
 ## Hardening Expectations
 
 1. Butler fails closed -- unauthenticated or unauthorized requests are rejected, never proxied.

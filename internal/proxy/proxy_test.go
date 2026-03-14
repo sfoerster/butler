@@ -2,10 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1561,4 +1565,384 @@ func issueExpiredToken(t *testing.T, secret, username string) string {
 		t.Fatalf("sign error: %v", err)
 	}
 	return tokenStr
+}
+
+// --- Phase 4b: OIDC authentication tests ---
+
+// oidcTestProvider is a mock OIDC provider for proxy integration tests.
+type oidcTestProvider struct {
+	server *httptest.Server
+	rsaKey *rsa.PrivateKey
+	kid    string
+	issuer string
+}
+
+func newOIDCTestProvider(t *testing.T) *oidcTestProvider {
+	t.Helper()
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &oidcTestProvider{rsaKey: rsaKey, kid: "proxy-test-key"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":   p.issuer,
+			"jwks_uri": p.issuer + "/jwks",
+		})
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		nBytes := p.rsaKey.N.Bytes()
+		eBytes := big.NewInt(int64(p.rsaKey.E)).Bytes()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"keys": []map[string]string{
+				{
+					"kty": "RSA",
+					"kid": p.kid,
+					"use": "sig",
+					"alg": "RS256",
+					"n":   base64.RawURLEncoding.EncodeToString(nBytes),
+					"e":   base64.RawURLEncoding.EncodeToString(eBytes),
+				},
+			},
+		})
+	})
+	p.server = httptest.NewServer(mux)
+	p.issuer = p.server.URL
+	return p
+}
+
+func (p *oidcTestProvider) signToken(claims jwt.MapClaims) string {
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = p.kid
+	signed, err := token.SignedString(p.rsaKey)
+	if err != nil {
+		panic(err)
+	}
+	return signed
+}
+
+func (p *oidcTestProvider) validClaims(roles []string) jwt.MapClaims {
+	iRoles := make([]interface{}, len(roles))
+	for i, r := range roles {
+		iRoles[i] = r
+	}
+	return jwt.MapClaims{
+		"iss":                p.issuer,
+		"aud":                "butler",
+		"sub":                "oidc-user-1",
+		"preferred_username": "alice-oidc",
+		"exp":                time.Now().Add(time.Hour).Unix(),
+		"iat":                time.Now().Unix(),
+		"realm_access": map[string]interface{}{
+			"roles": iRoles,
+		},
+	}
+}
+
+func (p *oidcTestProvider) close() {
+	p.server.Close()
+}
+
+func newOIDCProxy(t *testing.T, upstream *httptest.Server, provider *oidcTestProvider, rolePolicies map[string]config.RolePolicy) *Proxy {
+	t.Helper()
+	cfg := &config.Config{
+		Listen:   "127.0.0.1:0",
+		Upstream: upstream.URL,
+		Auth: config.AuthConfig{
+			Mode: "oidc",
+			OIDC: &config.OIDCConfig{
+				Issuer:        provider.issuer,
+				ClientID:      "butler",
+				RoleClaimPath: "realm_access.roles",
+			},
+		},
+		RolePolicies: rolePolicies,
+	}
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	p, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	return p
+}
+
+func TestAuthenticateOIDCMode(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	provider := newOIDCTestProvider(t)
+	defer provider.close()
+
+	p := newOIDCProxy(t, upstream, provider, map[string]config.RolePolicy{
+		"admin": {AllowModels: []string{"*"}},
+	})
+
+	token := provider.signToken(provider.validClaims([]string{"admin"}))
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/generate", strings.NewReader(`{"model":"llama3.2","prompt":"hi"}`))
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d, body = %s", w.Code, http.StatusOK, w.Body.String())
+	}
+}
+
+func TestAuthenticateOIDCExpired(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be reached")
+	}))
+	defer upstream.Close()
+
+	provider := newOIDCTestProvider(t)
+	defer provider.close()
+
+	p := newOIDCProxy(t, upstream, provider, map[string]config.RolePolicy{
+		"admin": {AllowModels: []string{"*"}},
+	})
+
+	claims := provider.validClaims([]string{"admin"})
+	claims["exp"] = time.Now().Add(-time.Hour).Unix()
+	token := provider.signToken(claims)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestAuthenticateOIDCNoMatchingRole(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be reached")
+	}))
+	defer upstream.Close()
+
+	provider := newOIDCTestProvider(t)
+	defer provider.close()
+
+	p := newOIDCProxy(t, upstream, provider, map[string]config.RolePolicy{
+		"admin": {AllowModels: []string{"*"}},
+	})
+
+	// Token has "viewer" role but only "admin" is configured
+	token := provider.signToken(provider.validClaims([]string{"viewer"}))
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestAuthenticateOIDCInvalidToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be reached")
+	}))
+	defer upstream.Close()
+
+	provider := newOIDCTestProvider(t)
+	defer provider.close()
+
+	p := newOIDCProxy(t, upstream, provider, map[string]config.RolePolicy{
+		"admin": {AllowModels: []string{"*"}},
+	})
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer not-a-valid-token")
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestAuthenticateEitherModeOIDC(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	provider := newOIDCTestProvider(t)
+	defer provider.close()
+
+	cfg := &config.Config{
+		Listen:   "127.0.0.1:0",
+		Upstream: upstream.URL,
+		Auth: config.AuthConfig{
+			Mode: "either",
+			OIDC: &config.OIDCConfig{
+				Issuer:        provider.issuer,
+				ClientID:      "butler",
+				RoleClaimPath: "realm_access.roles",
+			},
+		},
+		Clients: []config.Client{
+			{Name: "svc", Key: "sk-either-oidc", AllowModels: []string{"*"}},
+		},
+		RolePolicies: map[string]config.RolePolicy{
+			"operator": {AllowModels: []string{"llama3.2"}},
+		},
+	}
+
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	p, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	// API key should still work
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer sk-either-oidc")
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Errorf("API key: status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	// OIDC token should also work
+	token := provider.signToken(provider.validClaims([]string{"operator"}))
+	w2 := httptest.NewRecorder()
+	r2 := httptest.NewRequest("POST", "/api/generate", strings.NewReader(`{"model":"llama3.2","prompt":"hi"}`))
+	r2.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusOK {
+		t.Errorf("OIDC: status = %d, want %d, body = %s", w2.Code, http.StatusOK, w2.Body.String())
+	}
+}
+
+func TestOIDCModelACLFromRolePolicy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	provider := newOIDCTestProvider(t)
+	defer provider.close()
+
+	p := newOIDCProxy(t, upstream, provider, map[string]config.RolePolicy{
+		"viewer": {AllowModels: []string{"llama3.2:1b"}},
+	})
+
+	token := provider.signToken(provider.validClaims([]string{"viewer"}))
+
+	// Allowed model
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/generate", strings.NewReader(`{"model":"llama3.2:1b","prompt":"hi"}`))
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Errorf("allowed: status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	// Denied model
+	w2 := httptest.NewRecorder()
+	r2 := httptest.NewRequest("POST", "/api/generate", strings.NewReader(`{"model":"gpt-4","prompt":"hi"}`))
+	r2.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusForbidden {
+		t.Errorf("denied: status = %d, want %d", w2.Code, http.StatusForbidden)
+	}
+}
+
+func TestOIDCRateLimitFromRolePolicy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"models":[]}`))
+	}))
+	defer upstream.Close()
+
+	provider := newOIDCTestProvider(t)
+	defer provider.close()
+
+	spec, _ := config.ParseRateLimit("2/min")
+	p := newOIDCProxy(t, upstream, provider, map[string]config.RolePolicy{
+		"limited": {
+			AllowModels: []string{"*"},
+			RateLimit:   "2/min",
+		},
+	})
+	// Manually set the parsed rate on the policy
+	rp := p.config.RolePolicies["limited"]
+	rp.SetRateForTest(&spec)
+	p.config.RolePolicies["limited"] = rp
+
+	token := provider.signToken(provider.validClaims([]string{"limited"}))
+
+	for i := range 2 {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("GET", "/api/tags", nil)
+		r.Header.Set("Authorization", "Bearer "+token)
+		p.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want %d", i+1, w.Code, http.StatusOK)
+		}
+	}
+
+	// 3rd should be rate limited
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("rate limited: status = %d, want %d", w.Code, http.StatusTooManyRequests)
+	}
+}
+
+func TestOIDCUserIdentityInLogs(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	provider := newOIDCTestProvider(t)
+	defer provider.close()
+
+	var buf bytes.Buffer
+	cfg := &config.Config{
+		Listen:   "127.0.0.1:0",
+		Upstream: upstream.URL,
+		Auth: config.AuthConfig{
+			Mode: "oidc",
+			OIDC: &config.OIDCConfig{
+				Issuer:        provider.issuer,
+				ClientID:      "butler",
+				RoleClaimPath: "realm_access.roles",
+			},
+		},
+		RolePolicies: map[string]config.RolePolicy{
+			"admin": {AllowModels: []string{"*"}},
+		},
+	}
+
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	p, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	token := provider.signToken(provider.validClaims([]string{"admin"}))
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, `"user":"alice-oidc"`) {
+		t.Errorf("OIDC log missing user field, got:\n%s", logOutput)
+	}
 }

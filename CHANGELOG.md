@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- OIDC federation (`auth.mode: oidc`) -- validate tokens from external identity providers (Keycloak, Okta, Entra ID) using JWKS auto-discovery
+- Role-to-policy mapping (`role_policies`) -- map OIDC roles/groups to proxy policy without a database
+- Configurable role claim path (`oidc.role_claim_path`) for different IdP conventions (e.g. `realm_access.roles`, `groups`)
+- JWKS caching with background refresh and rate-limited on-demand refresh for key rotation
+- Multi-role merging with most-permissive-wins semantics (union of allowed models, highest rate limit)
+- `"unlimited"` rate limit value for role policies
+- `either` mode now accepts OIDC as an auth source alongside API keys and JWTs
 - JWT standalone authentication (`auth.mode: jwt_standalone`) with built-in `/auth/login` endpoint
 - Per-user identity with configurable model ACLs, rate limits, context caps, and prompt filtering
 - `either` auth mode accepting both API keys and JWT tokens

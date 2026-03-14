@@ -26,6 +26,8 @@ Butler gives you per-client API keys, model-level allowlists and denylists, rate
 - **Streaming support** -- SSE and chunked responses are passed through without buffering
 - **API key authentication** via `Authorization: Bearer <key>` header
 - **JWT authentication** -- standalone mode with built-in `/auth/login` endpoint for username/password login
+- **OIDC federation** -- validate tokens from external identity providers (Keycloak, Okta, Entra ID) using JWKS auto-discovery
+- **Role-to-policy mapping** -- map OIDC roles/groups to proxy policy (model ACLs, rate limits, caps) via YAML config
 - **Per-user policy** -- model ACLs, rate limits, context caps, and prompt filtering per authenticated user
 - **Per-key model allowlist** -- restrict which models each client can access
 - **Per-key model denylist** -- explicitly block specific models per client
@@ -138,9 +140,12 @@ See [`butler.example.yaml`](butler.example.yaml) for a full annotated example.
 |---|---|---|
 | `api_key` (default) | API keys only | ≥1 client |
 | `jwt_standalone` | JWTs only | ≥1 user, `jwt_secret` |
-| `either` | API keys or JWTs | ≥1 client or user, `jwt_secret` |
+| `oidc` | OIDC tokens only | `oidc` config, ≥1 `role_policy` |
+| `either` | API keys, JWTs, and/or OIDC | ≥1 auth source configured |
 
 In `jwt_standalone` or `either` mode, users authenticate via `POST /auth/login` with `{"username":"...","password":"..."}` and receive a JWT token. The token is then used as `Authorization: Bearer <token>` for subsequent requests.
+
+In `oidc` mode, users authenticate with tokens issued by an external identity provider. Butler validates the token signature via JWKS auto-discovery and maps roles from the token to proxy policy via `role_policies`.
 
 ### Configuration reference
 
@@ -150,7 +155,7 @@ In `jwt_standalone` or `either` mode, users authenticate via `POST /auth/login` 
 | `upstream` | string | yes | -- | Ollama server URL |
 | `global_rate_limit` | string | no | -- | Rate limit across all clients (e.g. `"600/min"`, `"1000/hour"`) |
 | `log_prompts` | bool | no | `false` | Log full prompt content at INFO level (privacy-sensitive) |
-| `auth.mode` | string | no | `api_key` | Authentication mode: `api_key`, `jwt_standalone`, or `either` |
+| `auth.mode` | string | no | `api_key` | Authentication mode: `api_key`, `jwt_standalone`, `oidc`, or `either` |
 | `auth.jwt_secret` | string | cond. | -- | JWT signing secret (≥32 chars, required for JWT modes) |
 | `auth.token_expiry` | string | no | `24h` | JWT token lifetime (e.g. `"12h"`, `"7d"`) |
 | `clients` | list | cond. | -- | At least one client for `api_key`/`either` mode |
@@ -173,6 +178,18 @@ In `jwt_standalone` or `either` mode, users authenticate via `POST /auth/login` 
 | `users[].max_ctx` | int | no | `0` (no limit) | Max `num_ctx` value allowed |
 | `users[].max_predict` | int | no | `0` (no limit) | Max `num_predict` value allowed |
 | `users[].deny_prompt_patterns` | list | no | `[]` | Regex patterns; prompts matching any pattern are rejected |
+| `auth.oidc.issuer` | string | cond. | -- | OIDC issuer URL (must be HTTPS, required for `oidc` mode) |
+| `auth.oidc.client_id` | string | cond. | -- | OIDC client ID (audience claim, required for `oidc` mode) |
+| `auth.oidc.role_claim_path` | string | cond. | -- | Dot-separated path to roles in JWT claims (e.g. `realm_access.roles`) |
+| `auth.oidc.refresh_interval` | string | no | `60m` | JWKS key refresh interval |
+| `role_policies` | map | cond. | -- | Role-to-policy mapping (required for `oidc` mode) |
+| `role_policies.<role>.allow_models` | list | no | `[]` | Models this role can access |
+| `role_policies.<role>.deny_models` | list | no | `[]` | Models explicitly denied |
+| `role_policies.<role>.rate_limit` | string | no | -- | Per-role rate limit (e.g. `"120/hour"`, `"unlimited"`) |
+| `role_policies.<role>.max_request_bytes` | int | no | `0` | Max request body size |
+| `role_policies.<role>.max_ctx` | int | no | `0` | Max `num_ctx` value |
+| `role_policies.<role>.max_predict` | int | no | `0` | Max `num_predict` value |
+| `role_policies.<role>.deny_prompt_patterns` | list | no | `[]` | Regex patterns to reject prompts |
 
 ### Model matching rules
 
@@ -215,6 +232,37 @@ curl http://localhost:8080/api/chat \
   -H "Authorization: Bearer eyJ..." \
   -d '{"model": "llama3.2", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
+
+### OIDC authentication
+
+```yaml
+# butler.yaml
+auth:
+  mode: oidc
+  oidc:
+    issuer: "https://auth.example.com/realms/default"
+    client_id: "butler"
+    role_claim_path: "realm_access.roles"
+
+role_policies:
+  admin:
+    allow_models: ["*"]
+  viewer:
+    allow_models: ["llama3.2:1b"]
+    rate_limit: "20/hour"
+    max_ctx: 2048
+```
+
+Users authenticate with the external IdP and use the issued token:
+
+```bash
+# Use an OIDC token from your identity provider
+curl http://localhost:8080/api/chat \
+  -H "Authorization: Bearer eyJ..." \
+  -d '{"model": "llama3.2", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+When a token carries multiple matching roles, policies are merged using most-permissive-wins (union of allowed models, highest rate limit, largest caps).
 
 ### Error responses
 
@@ -298,6 +346,7 @@ make clean       # Remove the binary
 ```
 cmd/butler/main.go               Entry point
 internal/auth/jwt.go             JWT issuance, validation, bcrypt password check
+internal/auth/oidc.go            OIDC discovery, JWKS fetch/cache, token validation, role extraction
 internal/config/config.go        YAML config loading, validation, model ACL, rate specs, Subject
 internal/proxy/proxy.go          Reverse proxy, auth, rate limiting, input filtering, response logging
 internal/proxy/login.go          /auth/login POST handler

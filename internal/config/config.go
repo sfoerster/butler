@@ -76,11 +76,43 @@ func (s *Subject) RateLimitKey() string {
 	return s.AuthSource + ":" + s.Name
 }
 
+// OIDCConfig defines OIDC federation settings.
+type OIDCConfig struct {
+	Issuer          string `yaml:"issuer"`
+	ClientID        string `yaml:"client_id"`
+	RoleClaimPath   string `yaml:"role_claim_path"`
+	RefreshInterval string `yaml:"refresh_interval"`
+	refreshInterval time.Duration
+}
+
+// RefreshIntervalDuration returns the parsed refresh interval, defaulting to 60m.
+func (o *OIDCConfig) RefreshIntervalDuration() time.Duration {
+	if o.refreshInterval == 0 {
+		return 60 * time.Minute
+	}
+	return o.refreshInterval
+}
+
+// RolePolicy defines policy for a role (used with OIDC federation).
+type RolePolicy struct {
+	AllowModels        []string `yaml:"allow_models"`
+	DenyModels         []string `yaml:"deny_models"`
+	RateLimit          string   `yaml:"rate_limit"` // "120/hour", "unlimited", or ""
+	MaxRequestBytes    int64    `yaml:"max_request_bytes"`
+	MaxCtx             int      `yaml:"max_ctx"`
+	MaxPredict         int      `yaml:"max_predict"`
+	DenyPromptPatterns []string `yaml:"deny_prompt_patterns"`
+	rate               *RateSpec
+	denyPatterns       []*regexp.Regexp
+	unlimited          bool
+}
+
 // AuthConfig defines authentication settings.
 type AuthConfig struct {
-	Mode        string `yaml:"mode"`          // "api_key", "jwt_standalone", "either"
-	JWTSecret   string `yaml:"jwt_secret"`
-	TokenExpiry string `yaml:"token_expiry"`  // e.g. "24h", default "24h"
+	Mode        string      `yaml:"mode"` // "api_key", "jwt_standalone", "oidc", "either"
+	JWTSecret   string      `yaml:"jwt_secret"`
+	TokenExpiry string      `yaml:"token_expiry"` // e.g. "24h", default "24h"
+	OIDC        *OIDCConfig `yaml:"oidc"`
 	tokenExpiry time.Duration
 }
 
@@ -138,13 +170,14 @@ func (u *User) SetRateForTest(spec *RateSpec) {
 }
 
 type Config struct {
-	Listen          string     `yaml:"listen"`
-	Upstream        string     `yaml:"upstream"`
-	GlobalRateLimit string     `yaml:"global_rate_limit"`
-	LogPrompts      bool       `yaml:"log_prompts"`
-	Auth            AuthConfig `yaml:"auth"`
-	Clients         []Client   `yaml:"clients"`
-	Users           []User     `yaml:"users"`
+	Listen          string                `yaml:"listen"`
+	Upstream        string                `yaml:"upstream"`
+	GlobalRateLimit string                `yaml:"global_rate_limit"`
+	LogPrompts      bool                  `yaml:"log_prompts"`
+	Auth            AuthConfig            `yaml:"auth"`
+	Clients         []Client              `yaml:"clients"`
+	Users           []User                `yaml:"users"`
+	RolePolicies    map[string]RolePolicy `yaml:"role_policies"`
 	globalRate      *RateSpec
 }
 
@@ -260,18 +293,37 @@ func (c *Config) validate() error {
 		if len(c.Auth.JWTSecret) < 32 {
 			return fmt.Errorf("jwt_secret must be at least 32 characters")
 		}
+	case "oidc":
+		if err := c.validateOIDC(); err != nil {
+			return err
+		}
 	case "either":
-		if len(c.Clients) == 0 && len(c.Users) == 0 {
-			return fmt.Errorf("either mode requires at least one client or user")
+		hasAPIKeys := len(c.Clients) > 0
+		hasUsers := len(c.Users) > 0
+		hasOIDC := c.Auth.OIDC != nil
+
+		if !hasAPIKeys && !hasUsers && !hasOIDC {
+			return fmt.Errorf("either mode requires at least one client, user, or oidc config")
 		}
-		if c.Auth.JWTSecret == "" {
-			return fmt.Errorf("jwt_secret is required for %s mode", c.Auth.Mode)
+		if hasUsers || (hasAPIKeys && !hasOIDC) {
+			// JWT secret needed when users are configured or when no OIDC fallback
+			if hasUsers {
+				if c.Auth.JWTSecret == "" {
+					return fmt.Errorf("jwt_secret is required for %s mode", c.Auth.Mode)
+				}
+				if len(c.Auth.JWTSecret) < 32 {
+					return fmt.Errorf("jwt_secret must be at least 32 characters")
+				}
+			}
 		}
-		if len(c.Auth.JWTSecret) < 32 {
-			return fmt.Errorf("jwt_secret must be at least 32 characters")
+		// If OIDC is configured in either mode, validate it
+		if hasOIDC {
+			if err := c.validateOIDC(); err != nil {
+				return err
+			}
 		}
 	default:
-		return fmt.Errorf("invalid auth mode %q: must be api_key, jwt_standalone, or either", c.Auth.Mode)
+		return fmt.Errorf("invalid auth mode %q: must be api_key, jwt_standalone, oidc, or either", c.Auth.Mode)
 	}
 
 	// Parse token expiry
@@ -434,6 +486,11 @@ func (c *Config) CompilePatternsForTest() {
 	}
 }
 
+// SetRateForTest sets the parsed per-role rate (for testing without Load).
+func (rp *RolePolicy) SetRateForTest(spec *RateSpec) {
+	rp.rate = spec
+}
+
 // CompileUserPatternsForTest compiles DenyPromptPatterns for all users (for testing without Load).
 func (c *Config) CompileUserPatternsForTest() {
 	for i, user := range c.Users {
@@ -442,6 +499,171 @@ func (c *Config) CompileUserPatternsForTest() {
 			c.Users[i].denyPatterns = append(c.Users[i].denyPatterns, re)
 		}
 	}
+}
+
+func (c *Config) validateOIDC() error {
+	if c.Auth.OIDC == nil {
+		return fmt.Errorf("oidc config is required for %s mode", c.Auth.Mode)
+	}
+	oidc := c.Auth.OIDC
+	if oidc.Issuer == "" {
+		return fmt.Errorf("oidc.issuer is required")
+	}
+	issuerURL, err := url.Parse(oidc.Issuer)
+	if err != nil {
+		return fmt.Errorf("oidc.issuer must be a valid URL: %w", err)
+	}
+	if issuerURL.Scheme != "https" {
+		return fmt.Errorf("oidc.issuer must use HTTPS")
+	}
+	if oidc.ClientID == "" {
+		return fmt.Errorf("oidc.client_id is required")
+	}
+	if oidc.RoleClaimPath == "" {
+		return fmt.Errorf("oidc.role_claim_path is required")
+	}
+	if oidc.RefreshInterval != "" {
+		d, err := time.ParseDuration(oidc.RefreshInterval)
+		if err != nil {
+			return fmt.Errorf("oidc.refresh_interval: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("oidc.refresh_interval must be positive")
+		}
+		oidc.refreshInterval = d
+	}
+
+	if len(c.RolePolicies) == 0 {
+		return fmt.Errorf("at least one role_policy is required for %s mode", c.Auth.Mode)
+	}
+
+	return c.validateRolePolicies()
+}
+
+func (c *Config) validateRolePolicies() error {
+	for name, rp := range c.RolePolicies {
+		if rp.RateLimit != "" {
+			if rp.RateLimit == "unlimited" {
+				rp.unlimited = true
+			} else {
+				spec, err := ParseRateLimit(rp.RateLimit)
+				if err != nil {
+					return fmt.Errorf("role_policy %q: rate_limit: %w", name, err)
+				}
+				rp.rate = &spec
+			}
+		}
+		if rp.MaxRequestBytes < 0 {
+			return fmt.Errorf("role_policy %q: max_request_bytes must not be negative", name)
+		}
+		if rp.MaxCtx < 0 {
+			return fmt.Errorf("role_policy %q: max_ctx must not be negative", name)
+		}
+		if rp.MaxPredict < 0 {
+			return fmt.Errorf("role_policy %q: max_predict must not be negative", name)
+		}
+		for j, pattern := range rp.DenyPromptPatterns {
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				return fmt.Errorf("role_policy %q: deny_prompt_patterns[%d]: %w", name, j, err)
+			}
+			rp.denyPatterns = append(rp.denyPatterns, re)
+		}
+		c.RolePolicies[name] = rp
+	}
+	return nil
+}
+
+// SubjectFromRoles merges matching role policies into a single Subject.
+// Returns nil if no roles match any configured policy.
+func (c *Config) SubjectFromRoles(name string, roles []string) *Subject {
+	var matched []string
+	for _, role := range roles {
+		if _, ok := c.RolePolicies[role]; ok {
+			matched = append(matched, role)
+		}
+	}
+	if len(matched) == 0 {
+		return nil
+	}
+
+	subj := &Subject{
+		Name:       name,
+		AuthSource: "oidc",
+	}
+
+	// Collect all allow models (union)
+	allowSet := make(map[string]bool)
+	hasWildcard := false
+	var unlimitedRate bool
+
+	for _, role := range matched {
+		rp := c.RolePolicies[role]
+		for _, m := range rp.AllowModels {
+			if m == "*" {
+				hasWildcard = true
+			}
+			allowSet[m] = true
+		}
+
+		// Rate: most permissive wins (unlimited > highest count)
+		if rp.unlimited {
+			unlimitedRate = true
+		} else if rp.rate != nil && !unlimitedRate {
+			if subj.Rate == nil {
+				subj.Rate = rp.rate
+			} else {
+				// Compare rates: higher count or longer window is more permissive
+				existingPerHour := float64(subj.Rate.Count) * float64(time.Hour) / float64(subj.Rate.Window)
+				newPerHour := float64(rp.rate.Count) * float64(time.Hour) / float64(rp.rate.Window)
+				if newPerHour > existingPerHour {
+					subj.Rate = rp.rate
+				}
+			}
+		}
+
+		// MaxReqBytes: most permissive (0=no limit wins, otherwise highest)
+		if rp.MaxRequestBytes == 0 && subj.MaxReqBytes != 0 {
+			subj.MaxReqBytes = 0
+		} else if rp.MaxRequestBytes > subj.MaxReqBytes {
+			subj.MaxReqBytes = rp.MaxRequestBytes
+		}
+
+		// MaxCtx: most permissive
+		if rp.MaxCtx == 0 && subj.MaxCtx != 0 {
+			subj.MaxCtx = 0
+		} else if rp.MaxCtx > subj.MaxCtx {
+			subj.MaxCtx = rp.MaxCtx
+		}
+
+		// MaxPredict: most permissive
+		if rp.MaxPredict == 0 && subj.MaxPredict != 0 {
+			subj.MaxPredict = 0
+		} else if rp.MaxPredict > subj.MaxPredict {
+			subj.MaxPredict = rp.MaxPredict
+		}
+	}
+
+	if unlimitedRate {
+		subj.Rate = nil // nil means unlimited
+	}
+
+	if hasWildcard {
+		subj.AllowModels = []string{"*"}
+	} else {
+		for m := range allowSet {
+			subj.AllowModels = append(subj.AllowModels, m)
+		}
+	}
+
+	// DenyModels/DenyPatterns: only applied when exactly one role matches
+	if len(matched) == 1 {
+		rp := c.RolePolicies[matched[0]]
+		subj.DenyModels = rp.DenyModels
+		subj.DenyPatterns = rp.denyPatterns
+	}
+
+	return subj
 }
 
 // matchModel checks if a model name matches a pattern.

@@ -23,6 +23,7 @@ type Proxy struct {
 	limiter *rateLimiter
 	metrics *metrics
 	jwt     *auth.JWTService
+	oidc    *auth.OIDCService
 }
 
 func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
@@ -39,7 +40,23 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	}
 
 	if cfg.Auth.Mode == "jwt_standalone" || cfg.Auth.Mode == "either" {
-		p.jwt = auth.NewJWTService(cfg.Auth.JWTSecret, cfg.Auth.TokenExpiryDuration())
+		if cfg.Auth.JWTSecret != "" {
+			p.jwt = auth.NewJWTService(cfg.Auth.JWTSecret, cfg.Auth.TokenExpiryDuration())
+		}
+	}
+
+	if (cfg.Auth.Mode == "oidc" || cfg.Auth.Mode == "either") && cfg.Auth.OIDC != nil {
+		oidcSvc, err := auth.NewOIDCService(
+			cfg.Auth.OIDC.Issuer,
+			cfg.Auth.OIDC.ClientID,
+			cfg.Auth.OIDC.RoleClaimPath,
+			cfg.Auth.OIDC.RefreshIntervalDuration(),
+			logger,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initializing OIDC: %w", err)
+		}
+		p.oidc = oidcSvc
 	}
 
 	p.reverse = &httputil.ReverseProxy{
@@ -57,6 +74,13 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	}
 
 	return p, nil
+}
+
+// Close stops background goroutines (e.g., OIDC JWKS refresh).
+func (p *Proxy) Close() {
+	if p.oidc != nil {
+		p.oidc.Stop()
+	}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -205,7 +229,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"path", r.URL.Path,
 		"remote", r.RemoteAddr,
 	}
-	if subj.AuthSource == "jwt" {
+	if subj.AuthSource == "jwt" || subj.AuthSource == "oidc" {
 		logAttrs = append(logAttrs, "user", subj.Name)
 	}
 	p.logger.Info("request", logAttrs...)
@@ -265,14 +289,32 @@ func (p *Proxy) authenticate(r *http.Request) *config.Subject {
 	if mode == "jwt_standalone" || mode == "either" {
 		if p.jwt != nil {
 			username, err := p.jwt.Validate(key)
-			if err != nil {
+			if err == nil {
+				user := p.config.UserByName(username)
+				if user != nil {
+					return user.Subject()
+				}
+			}
+			if mode == "jwt_standalone" {
 				return nil
 			}
-			user := p.config.UserByName(username)
-			if user == nil {
-				return nil
+		}
+	}
+
+	// Try OIDC validation
+	if mode == "oidc" || mode == "either" {
+		if p.oidc != nil {
+			claims, err := p.oidc.Validate(key)
+			if err == nil {
+				name := claims.PreferredUsername
+				if name == "" {
+					name = claims.Subject
+				}
+				subj := p.config.SubjectFromRoles(name, claims.Roles)
+				if subj != nil {
+					return subj
+				}
 			}
-			return user.Subject()
 		}
 	}
 
