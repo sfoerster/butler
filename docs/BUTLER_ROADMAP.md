@@ -67,12 +67,12 @@ clients:
 
 ### Phase 2 — Input Filtering and Rate Limiting
 
-- [ ] Regex-based prompt rejection (block requests matching patterns before they reach the model)
-- [ ] Per-key rate limiting (requests per minute/hour)
-- [ ] Per-key context length cap (reject requests with `num_ctx` above a threshold)
-- [ ] Per-key max tokens cap (`num_predict` ceiling)
-- [ ] Global rate limiting (protect Ollama from total overload)
-- [ ] Request size limit (reject abnormally large payloads)
+- [x] Regex-based prompt rejection (block requests matching patterns before they reach the model)
+- [x] Per-key rate limiting (requests per minute/hour)
+- [x] Per-key context length cap (reject requests with `num_ctx` above a threshold)
+- [x] Per-key max tokens cap (`num_predict` ceiling)
+- [x] Global rate limiting (protect Ollama from total overload)
+- [x] Request size limit (reject abnormally large payloads)
 
 ### Phase 3 — Observability
 

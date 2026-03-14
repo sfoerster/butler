@@ -19,6 +19,7 @@ type Proxy struct {
 	config  *config.Config
 	reverse *httputil.ReverseProxy
 	logger  *slog.Logger
+	limiter *rateLimiter
 }
 
 func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
@@ -28,8 +29,9 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	}
 
 	p := &Proxy{
-		config: cfg,
-		logger: logger,
+		config:  cfg,
+		logger:  logger,
+		limiter: newRateLimiter(),
 	}
 
 	p.reverse = &httputil.ReverseProxy{
@@ -52,7 +54,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	// Authenticate
+	// 1. Authenticate
 	client := p.authenticate(r)
 	if client == nil {
 		p.logger.Warn("unauthorized request",
@@ -63,14 +65,38 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract model from request body (if applicable)
-	model, body, err := extractModel(r)
+	// 2. Global rate limit
+	if !p.limiter.Allow("__global__", p.config.GlobalRate()) {
+		p.logger.Warn("global rate limit exceeded",
+			"client", client.Name,
+			"path", r.URL.Path,
+		)
+		writeJSON(w, http.StatusTooManyRequests, `{"error":"rate limit exceeded"}`)
+		return
+	}
+
+	// 3. Per-client rate limit
+	if !p.limiter.Allow(client.Name, client.Rate()) {
+		p.logger.Warn("client rate limit exceeded",
+			"client", client.Name,
+			"path", r.URL.Path,
+		)
+		writeJSON(w, http.StatusTooManyRequests, `{"error":"rate limit exceeded"}`)
+		return
+	}
+
+	// 4. Body inspection
+	info, err := inspectRequest(r, client.MaxRequestBytes)
 	if err != nil {
 		status := http.StatusBadRequest
 		resp := `{"error":"bad request"}`
 		if errors.Is(err, errBodyTooLarge) {
 			status = http.StatusRequestEntityTooLarge
 			resp = `{"error":"request body too large"}`
+		}
+		if errors.Is(err, errRequestTooLarge) {
+			status = http.StatusRequestEntityTooLarge
+			resp = `{"error":"request too large"}`
 		}
 		p.logger.Error("failed to read request body",
 			"error", err,
@@ -80,13 +106,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Restore body for proxying
-	if body != nil {
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r.ContentLength = int64(len(body))
+	var model string
+	if info != nil {
+		model = info.Model
+
+		// 5. Restore body for proxying
+		r.Body = io.NopCloser(bytes.NewReader(info.Body))
+		r.ContentLength = int64(len(info.Body))
 	}
 
-	// ACL check
+	// 6. Model ACL
 	if model != "" && !client.ModelAllowed(model) {
 		p.logger.Warn("model denied",
 			"client", client.Name,
@@ -97,6 +126,48 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 7. num_ctx cap
+	if info != nil && client.MaxCtx > 0 && info.NumCtx > client.MaxCtx {
+		p.logger.Warn("num_ctx exceeds limit",
+			"client", client.Name,
+			"num_ctx", info.NumCtx,
+			"limit", client.MaxCtx,
+		)
+		writeJSON(w, http.StatusBadRequest,
+			fmt.Sprintf(`{"error":"num_ctx %d exceeds limit of %d"}`, info.NumCtx, client.MaxCtx))
+		return
+	}
+
+	// 8. num_predict cap
+	if info != nil && client.MaxPredict > 0 && info.NumPredict > client.MaxPredict {
+		p.logger.Warn("num_predict exceeds limit",
+			"client", client.Name,
+			"num_predict", info.NumPredict,
+			"limit", client.MaxPredict,
+		)
+		writeJSON(w, http.StatusBadRequest,
+			fmt.Sprintf(`{"error":"num_predict %d exceeds limit of %d"}`, info.NumPredict, client.MaxPredict))
+		return
+	}
+
+	// 9. Prompt pattern rejection
+	if info != nil && len(client.DenyPatterns()) > 0 {
+		for _, re := range client.DenyPatterns() {
+			for _, prompt := range info.Prompts {
+				if re.MatchString(prompt) {
+					p.logger.Warn("prompt rejected",
+						"client", client.Name,
+						"pattern", re.String(),
+						"path", r.URL.Path,
+					)
+					writeJSON(w, http.StatusForbidden, `{"error":"prompt rejected"}`)
+					return
+				}
+			}
+		}
+	}
+
+	// 10. Log + proxy + response log
 	p.logger.Info("request",
 		"client", client.Name,
 		"model", model,
@@ -105,7 +176,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"remote", r.RemoteAddr,
 	)
 
-	// Wrap response writer to capture status code
 	wrapped := &statusWriter{ResponseWriter: w}
 	p.reverse.ServeHTTP(wrapped, r)
 

@@ -4,7 +4,50 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestParseRateLimit(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantCount int
+		wantWindow time.Duration
+		wantErr   bool
+	}{
+		{"10/min", 10, time.Minute, false},
+		{"600/min", 600, time.Minute, false},
+		{"1/min", 1, time.Minute, false},
+		{"100/hour", 100, time.Hour, false},
+		{"1/hour", 1, time.Hour, false},
+		{"0/min", 0, 0, true},
+		{"-5/min", 0, 0, true},
+		{"10/sec", 0, 0, true},
+		{"abc/min", 0, 0, true},
+		{"10", 0, 0, true},
+		{"", 0, 0, true},
+		{"/min", 0, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			spec, err := ParseRateLimit(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseRateLimit(%q) = %+v, want error", tt.input, spec)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseRateLimit(%q) error: %v", tt.input, err)
+			}
+			if spec.Count != tt.wantCount {
+				t.Errorf("Count = %d, want %d", spec.Count, tt.wantCount)
+			}
+			if spec.Window != tt.wantWindow {
+				t.Errorf("Window = %v, want %v", spec.Window, tt.wantWindow)
+			}
+		})
+	}
+}
 
 func TestMatchModel(t *testing.T) {
 	tests := []struct {
@@ -127,6 +170,63 @@ clients:
 	}
 }
 
+func TestLoadWithPhase2Fields(t *testing.T) {
+	yaml := `
+upstream: "http://localhost:11434"
+global_rate_limit: "600/min"
+clients:
+  - name: test-client
+    key: "sk-test"
+    allow_models: ["*"]
+    rate_limit: "10/min"
+    max_request_bytes: 1048576
+    max_ctx: 4096
+    max_predict: 512
+    deny_prompt_patterns:
+      - "(?i)ignore.*instructions"
+      - "secret.*password"
+`
+	path := filepath.Join(t.TempDir(), "butler.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.GlobalRate() == nil {
+		t.Fatal("GlobalRate() = nil, want non-nil")
+	}
+	if cfg.GlobalRate().Count != 600 {
+		t.Errorf("GlobalRate().Count = %d, want 600", cfg.GlobalRate().Count)
+	}
+	if cfg.GlobalRate().Window != time.Minute {
+		t.Errorf("GlobalRate().Window = %v, want 1m", cfg.GlobalRate().Window)
+	}
+
+	cl := &cfg.Clients[0]
+	if cl.Rate() == nil {
+		t.Fatal("Rate() = nil, want non-nil")
+	}
+	if cl.Rate().Count != 10 {
+		t.Errorf("Rate().Count = %d, want 10", cl.Rate().Count)
+	}
+	if cl.MaxRequestBytes != 1048576 {
+		t.Errorf("MaxRequestBytes = %d, want 1048576", cl.MaxRequestBytes)
+	}
+	if cl.MaxCtx != 4096 {
+		t.Errorf("MaxCtx = %d, want 4096", cl.MaxCtx)
+	}
+	if cl.MaxPredict != 512 {
+		t.Errorf("MaxPredict = %d, want 512", cl.MaxPredict)
+	}
+	if len(cl.DenyPatterns()) != 2 {
+		t.Fatalf("len(DenyPatterns()) = %d, want 2", len(cl.DenyPatterns()))
+	}
+}
+
 func TestLoadEnvExpansion(t *testing.T) {
 	t.Setenv("TEST_KEY", "sk-from-env")
 
@@ -194,6 +294,19 @@ clients: [{name: a, allow_models: ["*"]}]`},
 clients:
   - {name: a, key: same, allow_models: ["*"]}
   - {name: b, key: same, allow_models: ["*"]}`},
+		{"invalid global rate limit", `upstream: "http://localhost:11434"
+global_rate_limit: "bad"
+clients: [{name: a, key: k, allow_models: ["*"]}]`},
+		{"invalid client rate limit", `upstream: "http://localhost:11434"
+clients: [{name: a, key: k, allow_models: ["*"], rate_limit: "0/min"}]`},
+		{"negative max_request_bytes", `upstream: "http://localhost:11434"
+clients: [{name: a, key: k, allow_models: ["*"], max_request_bytes: -1}]`},
+		{"negative max_ctx", `upstream: "http://localhost:11434"
+clients: [{name: a, key: k, allow_models: ["*"], max_ctx: -1}]`},
+		{"negative max_predict", `upstream: "http://localhost:11434"
+clients: [{name: a, key: k, allow_models: ["*"], max_predict: -1}]`},
+		{"invalid deny_prompt_patterns regex", `upstream: "http://localhost:11434"
+clients: [{name: a, key: k, allow_models: ["*"], deny_prompt_patterns: ["[invalid"]}]`},
 	}
 
 	for _, tt := range tests {

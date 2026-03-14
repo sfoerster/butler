@@ -1,12 +1,12 @@
 # Butler
 
-An access-control reverse proxy for [Ollama](https://ollama.com). Butler sits between your clients and the Ollama API to handle authentication, model-level authorization, and structured logging -- things Ollama intentionally does not provide.
+An access-control reverse proxy for [Ollama](https://ollama.com). Butler sits between your clients and the Ollama API to handle authentication, model-level authorization, input filtering, rate limiting, and structured logging -- things Ollama intentionally does not provide.
 
 ```
 Client A ──┐
 Client B ──┼──▶ [butler :8080] ──▶ [ollama :11434]
 Client C ──┘
-            auth / ACL / log
+            auth / ACL / filter / limit / log
 ```
 
 ## Why
@@ -18,7 +18,7 @@ Ollama has no authentication or authorization. Any client that can reach port 11
 - You need to log or audit which clients are sending what requests
 - You want to prevent one runaway service from monopolizing your GPU
 
-Butler gives you per-client API keys, model-level allowlists and denylists, and structured JSON request logging -- all configured with a single YAML file.
+Butler gives you per-client API keys, model-level allowlists and denylists, rate limiting, input filtering, and structured JSON request logging -- all configured with a single YAML file.
 
 ## Features
 
@@ -28,6 +28,12 @@ Butler gives you per-client API keys, model-level allowlists and denylists, and 
 - **Per-key model allowlist** -- restrict which models each client can access
 - **Per-key model denylist** -- explicitly block specific models per client
 - **Deny by default** -- if a client has no allowlist entry for a model, the request is rejected
+- **Per-client rate limiting** -- cap requests per minute or per hour per client
+- **Global rate limiting** -- protect Ollama from total overload across all clients
+- **Request size limits** -- reject abnormally large payloads per client
+- **Context length cap** -- reject requests with `num_ctx` above a per-client threshold
+- **Token prediction cap** -- enforce a `num_predict` ceiling per client
+- **Regex prompt rejection** -- block requests matching configurable patterns before they reach the model
 - **Structured JSON logging** -- every request and response is logged with client identity, model, HTTP method, path, status code, and duration
 - **YAML configuration** with `${ENV_VAR}` interpolation for secrets
 - **Single static binary** -- no runtime dependencies, no database, no Redis
@@ -83,11 +89,18 @@ Butler is configured with a single YAML file. Secrets can be referenced as `${EN
 # butler.yaml
 listen: "127.0.0.1:8080"        # Address to listen on (default: 127.0.0.1:8080)
 upstream: "http://127.0.0.1:11434"  # Ollama address (required)
+global_rate_limit: "600/min"     # Global rate limit across all clients (optional)
 
 clients:
   - name: my-app                 # Human-readable client name (for logs)
     key: "${MY_APP_KEY}"         # API key (required, unique per client)
     allow_models: ["llama3.2", "mistral"]  # Models this client can use
+    rate_limit: "60/min"         # Per-client rate limit (optional)
+    max_request_bytes: 1048576   # Max request body size in bytes (optional)
+    max_ctx: 4096                # Max num_ctx value (optional)
+    max_predict: 512             # Max num_predict value (optional)
+    deny_prompt_patterns:        # Regex patterns to reject prompts (optional)
+      - "(?i)ignore.*instructions"
 
   - name: admin-tool
     key: "${ADMIN_KEY}"
@@ -97,6 +110,9 @@ clients:
     key: "${RESTRICTED_KEY}"
     allow_models: ["llama3.2:1b"]  # Specific model tag only
     deny_models: ["llama3.2:70b"] # Explicitly deny specific models
+    rate_limit: "10/min"
+    max_ctx: 2048
+    max_predict: 256
 ```
 
 See [`butler.example.yaml`](butler.example.yaml) for a full annotated example.
@@ -107,11 +123,17 @@ See [`butler.example.yaml`](butler.example.yaml) for a full annotated example.
 |---|---|---|---|---|
 | `listen` | string | no | `127.0.0.1:8080` | Address and port to listen on |
 | `upstream` | string | yes | -- | Ollama server URL |
+| `global_rate_limit` | string | no | -- | Rate limit across all clients (e.g. `"600/min"`, `"1000/hour"`) |
 | `clients` | list | yes | -- | At least one client must be defined |
 | `clients[].name` | string | yes | -- | Client identifier (appears in logs) |
 | `clients[].key` | string | yes | -- | API key for authentication (must be unique) |
 | `clients[].allow_models` | list | no | `[]` (deny all) | Models this client can access |
 | `clients[].deny_models` | list | no | `[]` | Models explicitly denied (checked before allowlist) |
+| `clients[].rate_limit` | string | no | -- | Per-client rate limit (e.g. `"60/min"`, `"100/hour"`) |
+| `clients[].max_request_bytes` | int | no | `0` (no limit) | Max request body size in bytes |
+| `clients[].max_ctx` | int | no | `0` (no limit) | Max `num_ctx` value allowed |
+| `clients[].max_predict` | int | no | `0` (no limit) | Max `num_predict` value allowed |
+| `clients[].deny_prompt_patterns` | list | no | `[]` | Regex patterns; prompts matching any pattern are rejected |
 
 ### Model matching rules
 
@@ -149,8 +171,13 @@ All errors are returned as JSON:
 |---|---|---|
 | `401` | `{"error":"unauthorized"}` | Missing or invalid API key |
 | `403` | `{"error":"model not allowed"}` | Client not authorized for the requested model |
+| `403` | `{"error":"prompt rejected"}` | Prompt matches a denied pattern |
 | `400` | `{"error":"bad request"}` | Malformed request body |
-| `413` | `{"error":"request body too large"}` | Model-bearing request body exceeds inspection limit |
+| `400` | `{"error":"num_ctx N exceeds limit of M"}` | `num_ctx` exceeds per-client cap |
+| `400` | `{"error":"num_predict N exceeds limit of M"}` | `num_predict` exceeds per-client cap |
+| `413` | `{"error":"request too large"}` | Request body exceeds per-client size limit |
+| `413` | `{"error":"request body too large"}` | Request body exceeds inspection limit (8 MiB) |
+| `429` | `{"error":"rate limit exceeded"}` | Per-client or global rate limit exceeded |
 | `502` | `{"error":"upstream unavailable"}` | Cannot reach Ollama |
 
 ### Supported endpoints
@@ -180,6 +207,8 @@ Denied requests are logged at `WARN` level:
 ```json
 {"time":"2025-03-05T10:30:05Z","level":"WARN","msg":"unauthorized request","path":"/api/chat","remote":"192.168.1.99:51234"}
 {"time":"2025-03-05T10:30:06Z","level":"WARN","msg":"model denied","client":"restricted-service","model":"llama3.2:70b","path":"/api/generate"}
+{"time":"2025-03-05T10:30:07Z","level":"WARN","msg":"client rate limit exceeded","client":"dev-sandbox","path":"/api/generate"}
+{"time":"2025-03-05T10:30:08Z","level":"WARN","msg":"prompt rejected","client":"dev-sandbox","pattern":"(?i)ignore.*instructions","path":"/api/generate"}
 ```
 
 Pipe logs to any collector that accepts JSON lines (journald, Loki, Datadog, etc.).
@@ -205,11 +234,13 @@ make clean       # Remove the binary
 
 ```
 cmd/butler/main.go              Entry point
-internal/config/config.go       YAML config loading, validation, model ACL
-internal/config/config_test.go  Config and ACL unit tests
-internal/proxy/proxy.go         Reverse proxy, auth middleware, response logging
-internal/proxy/model.go         Model name extraction from request bodies
+internal/config/config.go       YAML config loading, validation, model ACL, rate specs
+internal/config/config_test.go  Config, ACL, and Phase 2 field unit tests
+internal/proxy/proxy.go         Reverse proxy, auth, rate limiting, input filtering, response logging
+internal/proxy/model.go         Request body inspection (model, prompts, num_ctx, num_predict)
+internal/proxy/ratelimit.go     Fixed-window rate limiter
 internal/proxy/proxy_test.go    Proxy integration tests
+internal/proxy/ratelimit_test.go Rate limiter unit tests
 ```
 
 ### Running tests
@@ -240,7 +271,6 @@ The `.gitlab-ci.yml` pipeline runs three stages:
 
 See [`docs/BUTLER_ROADMAP.md`](docs/BUTLER_ROADMAP.md) for the full roadmap. Upcoming phases:
 
-- **Phase 2** -- Input filtering (regex prompt rejection), per-key rate limiting, context length and token caps
 - **Phase 3** -- Observability (Prometheus `/metrics`, `/healthz` health check, optional full-prompt logging)
 - **Phase 4** -- Multi-user identity (JWT auth, OIDC federation, per-user policy and token budgets)
 - **Phase 5** -- Advanced policy (time-of-day restrictions, config hot-reload, mTLS, webhook notifications)

@@ -19,9 +19,11 @@ Security-sensitive components include:
 
 1. **Authentication and API key handling** -- key validation, constant-time comparison, and rejection of unauthenticated requests (`internal/proxy/proxy.go`).
 2. **Model ACL enforcement** -- allowlist/denylist evaluation and deny-by-default logic (`internal/config/config.go`).
-3. **Request body inspection** -- model name extraction from incoming request bodies (`internal/proxy/model.go`).
-4. **Reverse proxy transport** -- upstream request forwarding, header handling, and response streaming (`internal/proxy/proxy.go`).
-5. **Configuration loading** -- YAML parsing and `${ENV_VAR}` interpolation of secrets (`internal/config/config.go`).
+3. **Request body inspection** -- model name extraction, prompt collection, and parameter parsing from incoming request bodies (`internal/proxy/model.go`).
+4. **Input filtering** -- regex-based prompt rejection, context length and token caps, and request size limits (`internal/proxy/proxy.go`, `internal/config/config.go`).
+5. **Rate limiting** -- per-client and global fixed-window rate limiting (`internal/proxy/ratelimit.go`).
+6. **Reverse proxy transport** -- upstream request forwarding, header handling, and response streaming (`internal/proxy/proxy.go`).
+7. **Configuration loading** -- YAML parsing and `${ENV_VAR}` interpolation of secrets (`internal/config/config.go`).
 
 ## Hardening Expectations
 
