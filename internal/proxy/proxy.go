@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sfoerster/butler/internal/auth"
 	"github.com/sfoerster/butler/internal/config"
 )
 
@@ -21,6 +22,7 @@ type Proxy struct {
 	logger  *slog.Logger
 	limiter *rateLimiter
 	metrics *metrics
+	jwt     *auth.JWTService
 }
 
 func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
@@ -34,6 +36,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 		logger:  logger,
 		limiter: newRateLimiter(),
 		metrics: newMetrics(),
+	}
+
+	if cfg.Auth.Mode == "jwt_standalone" || cfg.Auth.Mode == "either" {
+		p.jwt = auth.NewJWTService(cfg.Auth.JWTSecret, cfg.Auth.TokenExpiryDuration())
 	}
 
 	p.reverse = &httputil.ReverseProxy{
@@ -64,11 +70,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/metrics":
 		p.metrics.Handler().ServeHTTP(w, r)
 		return
+	case "/auth/login":
+		p.handleLogin(w, r)
+		return
 	}
 
 	// 1. Authenticate
-	client := p.authenticate(r)
-	if client == nil {
+	subj := p.authenticate(r)
+	if subj == nil {
 		p.logger.Warn("unauthorized request",
 			"path", r.URL.Path,
 			"remote", r.RemoteAddr,
@@ -81,27 +90,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 2. Global rate limit
 	if !p.limiter.Allow("__global__", p.config.GlobalRate()) {
 		p.logger.Warn("global rate limit exceeded",
-			"client", client.Name,
+			"client", subj.Name,
 			"path", r.URL.Path,
 		)
-		p.metrics.RecordRejection(client.Name, "rate_limited")
+		p.metrics.RecordRejection(subj.Name, "rate_limited")
 		writeJSON(w, http.StatusTooManyRequests, `{"error":"rate limit exceeded"}`)
 		return
 	}
 
-	// 3. Per-client rate limit
-	if !p.limiter.Allow(client.Name, client.Rate()) {
+	// 3. Per-subject rate limit
+	if !p.limiter.Allow(subj.RateLimitKey(), subj.Rate) {
 		p.logger.Warn("client rate limit exceeded",
-			"client", client.Name,
+			"client", subj.Name,
 			"path", r.URL.Path,
 		)
-		p.metrics.RecordRejection(client.Name, "rate_limited")
+		p.metrics.RecordRejection(subj.Name, "rate_limited")
 		writeJSON(w, http.StatusTooManyRequests, `{"error":"rate limit exceeded"}`)
 		return
 	}
 
 	// 4. Body inspection
-	info, err := inspectRequest(r, client.MaxRequestBytes)
+	info, err := inspectRequest(r, subj.MaxReqBytes)
 	if err != nil {
 		status := http.StatusBadRequest
 		resp := `{"error":"bad request"}`
@@ -116,9 +125,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		p.logger.Error("failed to read request body",
 			"error", err,
-			"client", client.Name,
+			"client", subj.Name,
 		)
-		p.metrics.RecordRejection(client.Name, reason)
+		p.metrics.RecordRejection(subj.Name, reason)
 		writeJSON(w, status, resp)
 		return
 	}
@@ -133,54 +142,54 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 6. Model ACL
-	if model != "" && !client.ModelAllowed(model) {
+	if model != "" && !subj.ModelAllowed(model) {
 		p.logger.Warn("model denied",
-			"client", client.Name,
+			"client", subj.Name,
 			"model", model,
 			"path", r.URL.Path,
 		)
-		p.metrics.RecordRejection(client.Name, "model_denied")
+		p.metrics.RecordRejection(subj.Name, "model_denied")
 		writeJSON(w, http.StatusForbidden, `{"error":"model not allowed"}`)
 		return
 	}
 
 	// 7. num_ctx cap
-	if info != nil && client.MaxCtx > 0 && info.NumCtx > client.MaxCtx {
+	if info != nil && subj.MaxCtx > 0 && info.NumCtx > subj.MaxCtx {
 		p.logger.Warn("num_ctx exceeds limit",
-			"client", client.Name,
+			"client", subj.Name,
 			"num_ctx", info.NumCtx,
-			"limit", client.MaxCtx,
+			"limit", subj.MaxCtx,
 		)
-		p.metrics.RecordRejection(client.Name, "num_ctx_exceeded")
+		p.metrics.RecordRejection(subj.Name, "num_ctx_exceeded")
 		writeJSON(w, http.StatusBadRequest,
-			fmt.Sprintf(`{"error":"num_ctx %d exceeds limit of %d"}`, info.NumCtx, client.MaxCtx))
+			fmt.Sprintf(`{"error":"num_ctx %d exceeds limit of %d"}`, info.NumCtx, subj.MaxCtx))
 		return
 	}
 
 	// 8. num_predict cap
-	if info != nil && client.MaxPredict > 0 && info.NumPredict > client.MaxPredict {
+	if info != nil && subj.MaxPredict > 0 && info.NumPredict > subj.MaxPredict {
 		p.logger.Warn("num_predict exceeds limit",
-			"client", client.Name,
+			"client", subj.Name,
 			"num_predict", info.NumPredict,
-			"limit", client.MaxPredict,
+			"limit", subj.MaxPredict,
 		)
-		p.metrics.RecordRejection(client.Name, "num_predict_exceeded")
+		p.metrics.RecordRejection(subj.Name, "num_predict_exceeded")
 		writeJSON(w, http.StatusBadRequest,
-			fmt.Sprintf(`{"error":"num_predict %d exceeds limit of %d"}`, info.NumPredict, client.MaxPredict))
+			fmt.Sprintf(`{"error":"num_predict %d exceeds limit of %d"}`, info.NumPredict, subj.MaxPredict))
 		return
 	}
 
 	// 9. Prompt pattern rejection
-	if info != nil && len(client.DenyPatterns()) > 0 {
-		for _, re := range client.DenyPatterns() {
+	if info != nil && len(subj.DenyPatterns) > 0 {
+		for _, re := range subj.DenyPatterns {
 			for _, prompt := range info.Prompts {
 				if re.MatchString(prompt) {
 					p.logger.Warn("prompt rejected",
-						"client", client.Name,
+						"client", subj.Name,
 						"pattern", re.String(),
 						"path", r.URL.Path,
 					)
-					p.metrics.RecordRejection(client.Name, "prompt_rejected")
+					p.metrics.RecordRejection(subj.Name, "prompt_rejected")
 					writeJSON(w, http.StatusForbidden, `{"error":"prompt rejected"}`)
 					return
 				}
@@ -189,18 +198,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 10. Log + proxy + response log
-	p.logger.Info("request",
-		"client", client.Name,
+	logAttrs := []any{
+		"client", subj.Name,
 		"model", model,
 		"method", r.Method,
 		"path", r.URL.Path,
 		"remote", r.RemoteAddr,
-	)
+	}
+	if subj.AuthSource == "jwt" {
+		logAttrs = append(logAttrs, "user", subj.Name)
+	}
+	p.logger.Info("request", logAttrs...)
 
 	// Optional prompt logging
 	if p.config.LogPrompts && info != nil && len(info.Prompts) > 0 {
 		p.logger.Info("prompts",
-			"client", client.Name,
+			"client", subj.Name,
 			"model", model,
 			"path", r.URL.Path,
 			"prompts", info.Prompts,
@@ -212,19 +225,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	duration := time.Since(start)
 	p.logger.Info("response",
-		"client", client.Name,
+		"client", subj.Name,
 		"model", model,
 		"path", r.URL.Path,
 		"status", wrapped.code,
 		"duration_ms", duration.Milliseconds(),
 	)
 
-	p.metrics.RecordRequest(client.Name, model, r.URL.Path, wrapped.code, duration)
+	p.metrics.RecordRequest(subj.Name, model, r.URL.Path, wrapped.code, duration)
 }
 
-func (p *Proxy) authenticate(r *http.Request) *config.Client {
-	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	scheme, token, ok := strings.Cut(auth, " ")
+func (p *Proxy) authenticate(r *http.Request) *config.Subject {
+	hdr := strings.TrimSpace(r.Header.Get("Authorization"))
+	scheme, token, ok := strings.Cut(hdr, " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") {
 		return nil
 	}
@@ -232,7 +245,38 @@ func (p *Proxy) authenticate(r *http.Request) *config.Client {
 	if key == "" {
 		return nil
 	}
-	return p.config.ClientByKey(key)
+
+	mode := p.config.Auth.Mode
+	if mode == "" {
+		mode = "api_key"
+	}
+
+	// Try API key lookup
+	if mode == "api_key" || mode == "either" {
+		if client := p.config.ClientByKey(key); client != nil {
+			return client.Subject()
+		}
+		if mode == "api_key" {
+			return nil
+		}
+	}
+
+	// Try JWT validation
+	if mode == "jwt_standalone" || mode == "either" {
+		if p.jwt != nil {
+			username, err := p.jwt.Validate(key)
+			if err != nil {
+				return nil
+			}
+			user := p.config.UserByName(username)
+			if user == nil {
+				return nil
+			}
+			return user.Subject()
+		}
+	}
+
+	return nil
 }
 
 // statusWriter wraps http.ResponseWriter to capture the status code.

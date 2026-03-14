@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/sfoerster/butler/internal/config"
 )
 
@@ -1228,4 +1230,335 @@ func TestMaxRequestBytesContentLengthFastPath(t *testing.T) {
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusRequestEntityTooLarge)
 	}
+}
+
+// --- Phase 4a: JWT authentication tests ---
+
+func newEitherModeProxy(t *testing.T, upstream *httptest.Server) *Proxy {
+	t.Helper()
+	cfg := &config.Config{
+		Listen:   "127.0.0.1:0",
+		Upstream: upstream.URL,
+		Auth: config.AuthConfig{
+			Mode:      "either",
+			JWTSecret: jwtTestSecret,
+		},
+		Clients: []config.Client{
+			{Name: "svc-client", Key: "sk-svc", AllowModels: []string{"*"}},
+		},
+		Users: []config.User{
+			{
+				Name:         "alice",
+				PasswordHash: hashPassword(t, "hunter2"),
+				AllowModels:  []string{"llama3.2"},
+			},
+		},
+	}
+
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	p, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestAuthenticateJWTStandaloneMode(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	p := newJWTProxy(t, upstream)
+
+	// Get a token via login
+	token := loginAndGetToken(t, p, "alice", "hunter2")
+
+	// Use token
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/generate", strings.NewReader(`{"model":"llama3.2","prompt":"hi"}`))
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d, body = %s", w.Code, http.StatusOK, w.Body.String())
+	}
+}
+
+func TestAuthenticateEitherModeAPIKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"models":[]}`))
+	}))
+	defer upstream.Close()
+
+	p := newEitherModeProxy(t, upstream)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer sk-svc")
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestAuthenticateEitherModeJWT(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	p := newEitherModeProxy(t, upstream)
+	token := loginAndGetToken(t, p, "alice", "hunter2")
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/generate", strings.NewReader(`{"model":"llama3.2","prompt":"hi"}`))
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d, body = %s", w.Code, http.StatusOK, w.Body.String())
+	}
+}
+
+func TestAuthenticateJWTExpired(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be reached")
+	}))
+	defer upstream.Close()
+
+	p := newJWTProxy(t, upstream)
+
+	// Create an expired token manually
+	expiredJWT := issueExpiredToken(t, jwtTestSecret, "alice")
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer "+expiredJWT)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestAuthenticateJWTInvalid(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be reached")
+	}))
+	defer upstream.Close()
+
+	p := newJWTProxy(t, upstream)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer not-a-valid-jwt")
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestAuthenticateJWTUnknownUser(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be reached")
+	}))
+	defer upstream.Close()
+
+	p := newJWTProxy(t, upstream)
+
+	// Issue a valid JWT for a user not in config
+	svc := p.jwt
+	token, err := svc.Issue("removed-user")
+	if err != nil {
+		t.Fatalf("Issue() error: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestUserModelACLThroughProxy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	p := newJWTProxy(t, upstream)
+	token := loginAndGetToken(t, p, "alice", "hunter2")
+
+	// Alice can use llama3.2
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/generate", strings.NewReader(`{"model":"llama3.2","prompt":"hi"}`))
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Errorf("allowed model: status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	// Alice cannot use gpt-4
+	w2 := httptest.NewRecorder()
+	r2 := httptest.NewRequest("POST", "/api/generate", strings.NewReader(`{"model":"gpt-4","prompt":"hi"}`))
+	r2.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusForbidden {
+		t.Errorf("denied model: status = %d, want %d", w2.Code, http.StatusForbidden)
+	}
+}
+
+func TestUserRateLimitThroughProxy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"models":[]}`))
+	}))
+	defer upstream.Close()
+
+	spec, _ := config.ParseRateLimit("2/min")
+	cfg := &config.Config{
+		Listen:   "127.0.0.1:0",
+		Upstream: upstream.URL,
+		Auth: config.AuthConfig{
+			Mode:      "jwt_standalone",
+			JWTSecret: jwtTestSecret,
+		},
+		Users: []config.User{
+			{
+				Name:         "limited-user",
+				PasswordHash: hashPassword(t, "pass"),
+				AllowModels:  []string{"*"},
+				RateLimit:    "2/min",
+			},
+		},
+	}
+	cfg.Users[0].SetRateForTest(&spec)
+
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	p, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	token := loginAndGetToken(t, p, "limited-user", "pass")
+
+	// First 2 requests should pass
+	for i := range 2 {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("GET", "/api/tags", nil)
+		r.Header.Set("Authorization", "Bearer "+token)
+		p.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want %d", i+1, w.Code, http.StatusOK)
+		}
+	}
+
+	// 3rd request should be rate limited
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("rate limited: status = %d, want %d", w.Code, http.StatusTooManyRequests)
+	}
+}
+
+func TestUserIdentityInLogs(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	var buf bytes.Buffer
+	cfg := &config.Config{
+		Listen:   "127.0.0.1:0",
+		Upstream: upstream.URL,
+		Auth: config.AuthConfig{
+			Mode:      "either",
+			JWTSecret: jwtTestSecret,
+		},
+		Clients: []config.Client{
+			{Name: "svc", Key: "sk-log-test", AllowModels: []string{"*"}},
+		},
+		Users: []config.User{
+			{
+				Name:         "log-user",
+				PasswordHash: hashPassword(t, "pass"),
+				AllowModels:  []string{"*"},
+			},
+		},
+	}
+
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	p, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// JWT request — should have "user" in logs
+	token := loginAndGetToken(t, p, "log-user", "pass")
+	buf.Reset()
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	p.ServeHTTP(w, r)
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, `"user":"log-user"`) {
+		t.Errorf("JWT log missing user field, got:\n%s", logOutput)
+	}
+
+	// API key request — should NOT have "user" in logs
+	buf.Reset()
+
+	w2 := httptest.NewRecorder()
+	r2 := httptest.NewRequest("GET", "/api/tags", nil)
+	r2.Header.Set("Authorization", "Bearer sk-log-test")
+	p.ServeHTTP(w2, r2)
+
+	logOutput2 := buf.String()
+	if strings.Contains(logOutput2, `"user"`) {
+		t.Errorf("API key log should not have user field, got:\n%s", logOutput2)
+	}
+}
+
+// --- helpers ---
+
+func loginAndGetToken(t *testing.T, p *Proxy, username, password string) string {
+	t.Helper()
+	body := fmt.Sprintf(`{"username":%q,"password":%q}`, username, password)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/auth/login", strings.NewReader(body))
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("login failed: status = %d, body = %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	return resp.Token
+}
+
+func issueExpiredToken(t *testing.T, secret, username string) string {
+	t.Helper()
+	now := time.Now()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": username,
+		"iat": now.Add(-2 * time.Hour).Unix(),
+		"exp": now.Add(-1 * time.Hour).Unix(),
+	})
+	tokenStr, err := token.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("sign error: %v", err)
+	}
+	return tokenStr
 }

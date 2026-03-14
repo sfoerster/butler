@@ -370,6 +370,366 @@ clients: [{name: a, key: k, allow_models: ["*"], deny_prompt_patterns: ["[invali
 	}
 }
 
+func TestLoadDefaultAuthMode(t *testing.T) {
+	yaml := `
+upstream: "http://localhost:11434"
+clients:
+  - name: test
+    key: "sk-test"
+    allow_models: ["*"]
+`
+	path := filepath.Join(t.TempDir(), "butler.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Auth.Mode != "api_key" {
+		t.Errorf("Auth.Mode = %q, want %q", cfg.Auth.Mode, "api_key")
+	}
+	if cfg.Auth.TokenExpiryDuration() != 24*time.Hour {
+		t.Errorf("TokenExpiry = %v, want 24h", cfg.Auth.TokenExpiryDuration())
+	}
+}
+
+func TestLoadJWTStandaloneMode(t *testing.T) {
+	yaml := `
+upstream: "http://localhost:11434"
+auth:
+  mode: jwt_standalone
+  jwt_secret: "this-is-a-very-long-secret-key-for-testing-purposes"
+  token_expiry: "12h"
+users:
+  - name: alice
+    password_hash: "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012"
+    allow_models: ["llama3.2"]
+    rate_limit: "10/min"
+    max_request_bytes: 1048576
+    max_ctx: 4096
+    max_predict: 512
+    deny_prompt_patterns:
+      - "(?i)ignore.*instructions"
+`
+	path := filepath.Join(t.TempDir(), "butler.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Auth.Mode != "jwt_standalone" {
+		t.Errorf("Auth.Mode = %q, want %q", cfg.Auth.Mode, "jwt_standalone")
+	}
+	if cfg.Auth.TokenExpiryDuration() != 12*time.Hour {
+		t.Errorf("TokenExpiry = %v, want 12h", cfg.Auth.TokenExpiryDuration())
+	}
+	if len(cfg.Users) != 1 {
+		t.Fatalf("len(Users) = %d, want 1", len(cfg.Users))
+	}
+	u := &cfg.Users[0]
+	if u.Name != "alice" {
+		t.Errorf("user name = %q, want %q", u.Name, "alice")
+	}
+	if u.Rate() == nil {
+		t.Fatal("user rate = nil, want non-nil")
+	}
+	if u.Rate().Count != 10 {
+		t.Errorf("user rate count = %d, want 10", u.Rate().Count)
+	}
+	if u.MaxRequestBytes != 1048576 {
+		t.Errorf("MaxRequestBytes = %d, want 1048576", u.MaxRequestBytes)
+	}
+	if u.MaxCtx != 4096 {
+		t.Errorf("MaxCtx = %d, want 4096", u.MaxCtx)
+	}
+	if u.MaxPredict != 512 {
+		t.Errorf("MaxPredict = %d, want 512", u.MaxPredict)
+	}
+	if len(u.DenyPatterns()) != 1 {
+		t.Fatalf("len(DenyPatterns) = %d, want 1", len(u.DenyPatterns()))
+	}
+}
+
+func TestLoadEitherMode(t *testing.T) {
+	yaml := `
+upstream: "http://localhost:11434"
+auth:
+  mode: either
+  jwt_secret: "this-is-a-very-long-secret-key-for-testing-purposes"
+clients:
+  - name: svc
+    key: "sk-svc"
+    allow_models: ["*"]
+users:
+  - name: bob
+    password_hash: "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012"
+    allow_models: ["llama3.2"]
+`
+	path := filepath.Join(t.TempDir(), "butler.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Auth.Mode != "either" {
+		t.Errorf("Auth.Mode = %q, want %q", cfg.Auth.Mode, "either")
+	}
+	if len(cfg.Clients) != 1 {
+		t.Errorf("len(Clients) = %d, want 1", len(cfg.Clients))
+	}
+	if len(cfg.Users) != 1 {
+		t.Errorf("len(Users) = %d, want 1", len(cfg.Users))
+	}
+}
+
+func TestLoadAuthValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{"jwt_standalone missing users", `upstream: "http://localhost:11434"
+auth:
+  mode: jwt_standalone
+  jwt_secret: "this-is-a-very-long-secret-key-for-testing-purposes"`},
+		{"jwt_standalone missing secret", `upstream: "http://localhost:11434"
+auth:
+  mode: jwt_standalone
+users:
+  - name: alice
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]`},
+		{"jwt_standalone short secret", `upstream: "http://localhost:11434"
+auth:
+  mode: jwt_standalone
+  jwt_secret: "tooshort"
+users:
+  - name: alice
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]`},
+		{"either missing secret", `upstream: "http://localhost:11434"
+auth:
+  mode: either
+users:
+  - name: alice
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]`},
+		{"either no clients or users", `upstream: "http://localhost:11434"
+auth:
+  mode: either
+  jwt_secret: "this-is-a-very-long-secret-key-for-testing-purposes"`},
+		{"invalid mode", `upstream: "http://localhost:11434"
+auth:
+  mode: "bogus"
+clients:
+  - name: a
+    key: k
+    allow_models: ["*"]`},
+		{"bad token_expiry", `upstream: "http://localhost:11434"
+auth:
+  mode: jwt_standalone
+  jwt_secret: "this-is-a-very-long-secret-key-for-testing-purposes"
+  token_expiry: "bad"
+users:
+  - name: a
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]`},
+		{"negative token_expiry", `upstream: "http://localhost:11434"
+auth:
+  mode: jwt_standalone
+  jwt_secret: "this-is-a-very-long-secret-key-for-testing-purposes"
+  token_expiry: "-1h"
+users:
+  - name: a
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "butler.yaml")
+			if err := os.WriteFile(path, []byte(tt.yaml), 0644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestLoadUserValidation(t *testing.T) {
+	base := func(users string) string {
+		return `upstream: "http://localhost:11434"
+auth:
+  mode: jwt_standalone
+  jwt_secret: "this-is-a-very-long-secret-key-for-testing-purposes"
+users:
+` + users
+	}
+
+	tests := []struct {
+		name  string
+		users string
+	}{
+		{"missing name", `  - password_hash: "$2a$10$hash"
+    allow_models: ["*"]`},
+		{"missing password_hash", `  - name: alice
+    allow_models: ["*"]`},
+		{"duplicate name", `  - name: alice
+    password_hash: "$2a$10$hash1"
+    allow_models: ["*"]
+  - name: alice
+    password_hash: "$2a$10$hash2"
+    allow_models: ["*"]`},
+		{"negative max_request_bytes", `  - name: alice
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]
+    max_request_bytes: -1`},
+		{"negative max_ctx", `  - name: alice
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]
+    max_ctx: -1`},
+		{"negative max_predict", `  - name: alice
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]
+    max_predict: -1`},
+		{"bad rate_limit", `  - name: alice
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]
+    rate_limit: "bad"`},
+		{"bad regex", `  - name: alice
+    password_hash: "$2a$10$hash"
+    allow_models: ["*"]
+    deny_prompt_patterns: ["[invalid"]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "butler.yaml")
+			if err := os.WriteFile(path, []byte(base(tt.users)), 0644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestUserByName(t *testing.T) {
+	cfg := &Config{
+		Users: []User{
+			{Name: "alice"},
+			{Name: "bob"},
+		},
+	}
+
+	if u := cfg.UserByName("alice"); u == nil || u.Name != "alice" {
+		t.Error("expected alice")
+	}
+	if u := cfg.UserByName("bob"); u == nil || u.Name != "bob" {
+		t.Error("expected bob")
+	}
+	if u := cfg.UserByName("charlie"); u != nil {
+		t.Error("expected nil for unknown user")
+	}
+}
+
+func TestUserSubject(t *testing.T) {
+	rate := &RateSpec{Count: 10, Window: time.Minute}
+	u := User{
+		Name:            "alice",
+		AllowModels:     []string{"llama3.2"},
+		DenyModels:      []string{"gpt-4"},
+		MaxRequestBytes: 1024,
+		MaxCtx:          4096,
+		MaxPredict:      512,
+	}
+	u.SetRateForTest(rate)
+
+	s := u.Subject()
+	if s.Name != "alice" {
+		t.Errorf("Name = %q, want alice", s.Name)
+	}
+	if s.AuthSource != "jwt" {
+		t.Errorf("AuthSource = %q, want jwt", s.AuthSource)
+	}
+	if s.Rate != rate {
+		t.Error("Rate not carried through")
+	}
+	if s.MaxReqBytes != 1024 {
+		t.Errorf("MaxReqBytes = %d, want 1024", s.MaxReqBytes)
+	}
+	if s.MaxCtx != 4096 {
+		t.Errorf("MaxCtx = %d, want 4096", s.MaxCtx)
+	}
+	if s.MaxPredict != 512 {
+		t.Errorf("MaxPredict = %d, want 512", s.MaxPredict)
+	}
+}
+
+func TestClientSubject(t *testing.T) {
+	cl := Client{
+		Name:        "svc",
+		AllowModels: []string{"*"},
+	}
+	s := cl.Subject()
+	if s.AuthSource != "api_key" {
+		t.Errorf("AuthSource = %q, want api_key", s.AuthSource)
+	}
+}
+
+func TestSubjectModelAllowed(t *testing.T) {
+	tests := []struct {
+		name    string
+		subject Subject
+		model   string
+		want    bool
+	}{
+		{"wildcard allows all", Subject{AllowModels: []string{"*"}}, "anything", true},
+		{"specific allowed", Subject{AllowModels: []string{"llama3.2"}}, "llama3.2", true},
+		{"not in allowlist", Subject{AllowModels: []string{"llama3.2"}}, "mistral", false},
+		{"deny by default", Subject{}, "llama3.2", false},
+		{"deny overrides allow", Subject{AllowModels: []string{"*"}, DenyModels: []string{"gpt-4"}}, "gpt-4", false},
+		{"deny allows others", Subject{AllowModels: []string{"*"}, DenyModels: []string{"gpt-4"}}, "llama3.2", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.subject.ModelAllowed(tt.model); got != tt.want {
+				t.Errorf("ModelAllowed(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSubjectRateLimitKey(t *testing.T) {
+	apiKey := Subject{Name: "svc", AuthSource: "api_key"}
+	jwt := Subject{Name: "svc", AuthSource: "jwt"}
+
+	if apiKey.RateLimitKey() == jwt.RateLimitKey() {
+		t.Errorf("rate limit keys should differ: %q == %q", apiKey.RateLimitKey(), jwt.RateLimitKey())
+	}
+	if apiKey.RateLimitKey() != "api_key:svc" {
+		t.Errorf("api_key key = %q, want api_key:svc", apiKey.RateLimitKey())
+	}
+	if jwt.RateLimitKey() != "jwt:svc" {
+		t.Errorf("jwt key = %q, want jwt:svc", jwt.RateLimitKey())
+	}
+}
+
 func TestClientByKey(t *testing.T) {
 	cfg := &Config{
 		Clients: []Client{

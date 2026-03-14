@@ -27,7 +27,11 @@ Security-sensitive components include:
 
 ## Unauthenticated Endpoints
 
-The `/healthz` and `/metrics` endpoints do not require authentication. They are intended for use by load balancers, orchestrators, and monitoring systems. If your deployment requires these to be restricted, place Butler behind a reverse proxy that limits access to these paths.
+The `/healthz`, `/metrics`, and `/auth/login` endpoints do not require authentication. `/healthz` and `/metrics` are intended for load balancers and monitoring systems. `/auth/login` accepts username/password credentials and returns a JWT token (returns 404 when auth mode is `api_key`). If your deployment requires these to be restricted, place Butler behind a reverse proxy that limits access to these paths.
+
+## JWT Secret
+
+When using `jwt_standalone` or `either` auth mode, the `jwt_secret` must be at least 32 characters. Use a cryptographically random string. Load it via environment variable interpolation (`${JWT_SECRET}`), not hardcoded in config files.
 
 ## Hardening Expectations
 

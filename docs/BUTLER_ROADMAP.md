@@ -89,22 +89,22 @@ The MVP uses per-service API keys. This phase adds per-user identity so multiple
 
 Two modes: standalone (built-in user management) or federated (delegate to an external OIDC provider like Keycloak, Okta, or Entra ID).
 
-- [ ] JWT authentication — proxy validates JWTs (HS256/RS256) in `Authorization: Bearer <token>` header
-- [ ] **Standalone mode**: built-in `/auth/login` endpoint — accepts username/password, returns a signed JWT (users defined in config)
+- [x] JWT authentication — proxy validates JWTs (HS256) in `Authorization: Bearer <token>` header
+- [x] **Standalone mode**: built-in `/auth/login` endpoint — accepts username/password, returns a signed JWT (users defined in config)
 - [ ] **OIDC mode**: proxy acts as an OIDC relying party — validates tokens issued by an external provider (Keycloak, Okta, Entra ID, etc.) using JWKS discovery
 - [ ] OIDC auto-discovery via `/.well-known/openid-configuration` from the issuer URL
 - [ ] Role-to-policy mapping — map OIDC roles/groups from JWT claims to proxy policy (e.g., `admin` → all models, `viewer` → restricted models)
 - [ ] Configurable role claim path (`realm_access.roles` for Keycloak, `groups` for Okta, etc.)
 - [ ] JWT claims carry user identity (`sub`), allowed models, rate-limit tier, and expiry
-- [ ] API keys (Phase 1) remain supported — a key can optionally be scoped to a user identity
-- [ ] Configurable auth mode per-listener: `api_key`, `jwt_standalone`, `oidc`, or `either`
+- [x] API keys (Phase 1) remain supported — a key can optionally be scoped to a user identity
+- [x] Configurable auth mode per-listener: `api_key`, `jwt_standalone`, or `either`
 
 **Per-User Policy**
 
-- [ ] Per-user model allowlist/denylist (independent of per-service restrictions — both must pass)
-- [ ] Per-user rate limits (e.g., kids get 20 req/hr, adults unlimited)
+- [x] Per-user model allowlist/denylist (independent of per-service restrictions — both must pass)
+- [x] Per-user rate limits (e.g., kids get 20 req/hr, adults unlimited)
 - [ ] Per-user token budget (daily/monthly ceiling on `eval_count` tokens consumed)
-- [ ] Usage tracking by user identity in structured logs (`"user": "alice"` alongside `"client": "linkedin-copilot"`)
+- [x] Usage tracking by user identity in structured logs (`"user": "alice"` alongside `"client": "linkedin-copilot"`)
 
 **Context Isolation**
 

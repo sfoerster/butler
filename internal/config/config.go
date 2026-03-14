@@ -40,12 +40,111 @@ func ParseRateLimit(s string) (RateSpec, error) {
 	return RateSpec{Count: count, Window: window}, nil
 }
 
+// Subject is a common identity type used by both Client and User for policy enforcement.
+type Subject struct {
+	Name         string
+	AuthSource   string // "api_key" or "jwt"
+	AllowModels  []string
+	DenyModels   []string
+	Rate         *RateSpec
+	MaxReqBytes  int64
+	MaxCtx       int
+	MaxPredict   int
+	DenyPatterns []*regexp.Regexp
+}
+
+// ModelAllowed checks whether this subject is permitted to use the given model.
+func (s *Subject) ModelAllowed(model string) bool {
+	for _, pattern := range s.DenyModels {
+		if matchModel(pattern, model) {
+			return false
+		}
+	}
+	if len(s.AllowModels) == 0 {
+		return false
+	}
+	for _, pattern := range s.AllowModels {
+		if matchModel(pattern, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// RateLimitKey returns a key for rate limiting that avoids collisions between auth sources.
+func (s *Subject) RateLimitKey() string {
+	return s.AuthSource + ":" + s.Name
+}
+
+// AuthConfig defines authentication settings.
+type AuthConfig struct {
+	Mode        string `yaml:"mode"`          // "api_key", "jwt_standalone", "either"
+	JWTSecret   string `yaml:"jwt_secret"`
+	TokenExpiry string `yaml:"token_expiry"`  // e.g. "24h", default "24h"
+	tokenExpiry time.Duration
+}
+
+// TokenExpiryDuration returns the parsed token expiry duration.
+func (a *AuthConfig) TokenExpiryDuration() time.Duration {
+	if a.tokenExpiry == 0 {
+		return 24 * time.Hour
+	}
+	return a.tokenExpiry
+}
+
+// User defines a JWT-authenticated user.
+type User struct {
+	Name               string   `yaml:"name"`
+	PasswordHash       string   `yaml:"password_hash"`
+	AllowModels        []string `yaml:"allow_models"`
+	DenyModels         []string `yaml:"deny_models"`
+	RateLimit          string   `yaml:"rate_limit"`
+	MaxRequestBytes    int64    `yaml:"max_request_bytes"`
+	MaxCtx             int      `yaml:"max_ctx"`
+	MaxPredict         int      `yaml:"max_predict"`
+	DenyPromptPatterns []string `yaml:"deny_prompt_patterns"`
+	rate               *RateSpec
+	denyPatterns       []*regexp.Regexp
+}
+
+// Rate returns the parsed per-user rate limit, or nil if not set.
+func (u *User) Rate() *RateSpec {
+	return u.rate
+}
+
+// DenyPatterns returns the compiled deny prompt regexes.
+func (u *User) DenyPatterns() []*regexp.Regexp {
+	return u.denyPatterns
+}
+
+// Subject returns a Subject for this user.
+func (u *User) Subject() *Subject {
+	return &Subject{
+		Name:         u.Name,
+		AuthSource:   "jwt",
+		AllowModels:  u.AllowModels,
+		DenyModels:   u.DenyModels,
+		Rate:         u.rate,
+		MaxReqBytes:  u.MaxRequestBytes,
+		MaxCtx:       u.MaxCtx,
+		MaxPredict:   u.MaxPredict,
+		DenyPatterns: u.denyPatterns,
+	}
+}
+
+// SetRateForTest sets the parsed per-user rate (for testing without Load).
+func (u *User) SetRateForTest(spec *RateSpec) {
+	u.rate = spec
+}
+
 type Config struct {
-	Listen          string   `yaml:"listen"`
-	Upstream        string   `yaml:"upstream"`
-	GlobalRateLimit string   `yaml:"global_rate_limit"`
-	LogPrompts      bool     `yaml:"log_prompts"`
-	Clients         []Client `yaml:"clients"`
+	Listen          string     `yaml:"listen"`
+	Upstream        string     `yaml:"upstream"`
+	GlobalRateLimit string     `yaml:"global_rate_limit"`
+	LogPrompts      bool       `yaml:"log_prompts"`
+	Auth            AuthConfig `yaml:"auth"`
+	Clients         []Client   `yaml:"clients"`
+	Users           []User     `yaml:"users"`
 	globalRate      *RateSpec
 }
 
@@ -76,6 +175,21 @@ func (cl *Client) Rate() *RateSpec {
 // DenyPatterns returns the compiled deny prompt regexes.
 func (cl *Client) DenyPatterns() []*regexp.Regexp {
 	return cl.denyPatterns
+}
+
+// Subject returns a Subject for this client.
+func (cl *Client) Subject() *Subject {
+	return &Subject{
+		Name:         cl.Name,
+		AuthSource:   "api_key",
+		AllowModels:  cl.AllowModels,
+		DenyModels:   cl.DenyModels,
+		Rate:         cl.rate,
+		MaxReqBytes:  cl.MaxRequestBytes,
+		MaxCtx:       cl.MaxCtx,
+		MaxPredict:   cl.MaxPredict,
+		DenyPatterns: cl.denyPatterns,
+	}
 }
 
 // Load reads and parses the config file, expanding ${VAR} environment variables.
@@ -126,8 +240,93 @@ func (c *Config) validate() error {
 		c.globalRate = &spec
 	}
 
-	if len(c.Clients) == 0 {
-		return fmt.Errorf("at least one client must be configured")
+	// Auth mode defaults and validation
+	if c.Auth.Mode == "" {
+		c.Auth.Mode = "api_key"
+	}
+
+	switch c.Auth.Mode {
+	case "api_key":
+		if len(c.Clients) == 0 {
+			return fmt.Errorf("at least one client must be configured")
+		}
+	case "jwt_standalone":
+		if len(c.Users) == 0 {
+			return fmt.Errorf("jwt_standalone mode requires at least one user")
+		}
+		if c.Auth.JWTSecret == "" {
+			return fmt.Errorf("jwt_secret is required for %s mode", c.Auth.Mode)
+		}
+		if len(c.Auth.JWTSecret) < 32 {
+			return fmt.Errorf("jwt_secret must be at least 32 characters")
+		}
+	case "either":
+		if len(c.Clients) == 0 && len(c.Users) == 0 {
+			return fmt.Errorf("either mode requires at least one client or user")
+		}
+		if c.Auth.JWTSecret == "" {
+			return fmt.Errorf("jwt_secret is required for %s mode", c.Auth.Mode)
+		}
+		if len(c.Auth.JWTSecret) < 32 {
+			return fmt.Errorf("jwt_secret must be at least 32 characters")
+		}
+	default:
+		return fmt.Errorf("invalid auth mode %q: must be api_key, jwt_standalone, or either", c.Auth.Mode)
+	}
+
+	// Parse token expiry
+	if c.Auth.TokenExpiry == "" {
+		c.Auth.tokenExpiry = 24 * time.Hour
+	} else {
+		d, err := time.ParseDuration(c.Auth.TokenExpiry)
+		if err != nil {
+			return fmt.Errorf("token_expiry: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("token_expiry must be positive")
+		}
+		c.Auth.tokenExpiry = d
+	}
+
+	// Validate users
+	userNames := make(map[string]bool)
+	for i, user := range c.Users {
+		if user.Name == "" {
+			return fmt.Errorf("user %d: name is required", i)
+		}
+		if user.PasswordHash == "" {
+			return fmt.Errorf("user %q: password_hash is required", user.Name)
+		}
+		if userNames[user.Name] {
+			return fmt.Errorf("user %q: duplicate name", user.Name)
+		}
+		userNames[user.Name] = true
+
+		if user.RateLimit != "" {
+			spec, err := ParseRateLimit(user.RateLimit)
+			if err != nil {
+				return fmt.Errorf("user %q: rate_limit: %w", user.Name, err)
+			}
+			c.Users[i].rate = &spec
+		}
+
+		if user.MaxRequestBytes < 0 {
+			return fmt.Errorf("user %q: max_request_bytes must not be negative", user.Name)
+		}
+		if user.MaxCtx < 0 {
+			return fmt.Errorf("user %q: max_ctx must not be negative", user.Name)
+		}
+		if user.MaxPredict < 0 {
+			return fmt.Errorf("user %q: max_predict must not be negative", user.Name)
+		}
+
+		for j, pattern := range user.DenyPromptPatterns {
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				return fmt.Errorf("user %q: deny_prompt_patterns[%d]: %w", user.Name, j, err)
+			}
+			c.Users[i].denyPatterns = append(c.Users[i].denyPatterns, re)
+		}
 	}
 
 	keys := make(map[string]bool)
@@ -185,6 +384,16 @@ func (c *Config) ClientByKey(key string) *Client {
 	return nil
 }
 
+// UserByName returns the user config for the given username, or nil if not found.
+func (c *Config) UserByName(name string) *User {
+	for i := range c.Users {
+		if c.Users[i].Name == name {
+			return &c.Users[i]
+		}
+	}
+	return nil
+}
+
 // ModelAllowed checks whether this client is permitted to use the given model.
 // Denylist is checked first. Then allowlist must match (deny by default).
 func (cl *Client) ModelAllowed(model string) bool {
@@ -221,6 +430,16 @@ func (c *Config) CompilePatternsForTest() {
 		for _, pattern := range client.DenyPromptPatterns {
 			re := regexp.MustCompile(pattern)
 			c.Clients[i].denyPatterns = append(c.Clients[i].denyPatterns, re)
+		}
+	}
+}
+
+// CompileUserPatternsForTest compiles DenyPromptPatterns for all users (for testing without Load).
+func (c *Config) CompileUserPatternsForTest() {
+	for i, user := range c.Users {
+		for _, pattern := range user.DenyPromptPatterns {
+			re := regexp.MustCompile(pattern)
+			c.Users[i].denyPatterns = append(c.Users[i].denyPatterns, re)
 		}
 	}
 }

@@ -25,6 +25,8 @@ Butler gives you per-client API keys, model-level allowlists and denylists, rate
 - **Transparent reverse proxy** for both Ollama's native API (`/api/*`) and OpenAI-compatible API (`/v1/*`)
 - **Streaming support** -- SSE and chunked responses are passed through without buffering
 - **API key authentication** via `Authorization: Bearer <key>` header
+- **JWT authentication** -- standalone mode with built-in `/auth/login` endpoint for username/password login
+- **Per-user policy** -- model ACLs, rate limits, context caps, and prompt filtering per authenticated user
 - **Per-key model allowlist** -- restrict which models each client can access
 - **Per-key model denylist** -- explicitly block specific models per client
 - **Deny by default** -- if a client has no allowlist entry for a model, the request is rejected
@@ -95,6 +97,12 @@ upstream: "http://127.0.0.1:11434"  # Ollama address (required)
 global_rate_limit: "600/min"     # Global rate limit across all clients (optional)
 log_prompts: false               # Log full prompts at INFO level (default: false)
 
+# Authentication mode (optional, default: api_key)
+auth:
+  mode: either                   # "api_key", "jwt_standalone", or "either"
+  jwt_secret: "${JWT_SECRET}"    # Required for jwt_standalone/either (≥32 chars)
+  token_expiry: "24h"            # JWT token lifetime (default: 24h)
+
 clients:
   - name: my-app                 # Human-readable client name (for logs)
     key: "${MY_APP_KEY}"         # API key (required, unique per client)
@@ -110,16 +118,29 @@ clients:
     key: "${ADMIN_KEY}"
     allow_models: ["*"]          # Wildcard: access to all models
 
-  - name: restricted-service
-    key: "${RESTRICTED_KEY}"
-    allow_models: ["llama3.2:1b"]  # Specific model tag only
-    deny_models: ["llama3.2:70b"] # Explicitly deny specific models
-    rate_limit: "10/min"
+users:
+  - name: alice                  # Username for JWT login
+    password_hash: "$2b$10$..."  # bcrypt hash of password
+    allow_models: ["*"]          # Per-user model allowlist
+  - name: kid1
+    password_hash: "$2b$10$..."
+    allow_models: ["llama3.2"]
+    rate_limit: "20/hour"        # Per-user rate limit
     max_ctx: 2048
     max_predict: 256
 ```
 
 See [`butler.example.yaml`](butler.example.yaml) for a full annotated example.
+
+### Authentication modes
+
+| Mode | Accepted auth | Required config |
+|---|---|---|
+| `api_key` (default) | API keys only | ≥1 client |
+| `jwt_standalone` | JWTs only | ≥1 user, `jwt_secret` |
+| `either` | API keys or JWTs | ≥1 client or user, `jwt_secret` |
+
+In `jwt_standalone` or `either` mode, users authenticate via `POST /auth/login` with `{"username":"...","password":"..."}` and receive a JWT token. The token is then used as `Authorization: Bearer <token>` for subsequent requests.
 
 ### Configuration reference
 
@@ -129,7 +150,10 @@ See [`butler.example.yaml`](butler.example.yaml) for a full annotated example.
 | `upstream` | string | yes | -- | Ollama server URL |
 | `global_rate_limit` | string | no | -- | Rate limit across all clients (e.g. `"600/min"`, `"1000/hour"`) |
 | `log_prompts` | bool | no | `false` | Log full prompt content at INFO level (privacy-sensitive) |
-| `clients` | list | yes | -- | At least one client must be defined |
+| `auth.mode` | string | no | `api_key` | Authentication mode: `api_key`, `jwt_standalone`, or `either` |
+| `auth.jwt_secret` | string | cond. | -- | JWT signing secret (≥32 chars, required for JWT modes) |
+| `auth.token_expiry` | string | no | `24h` | JWT token lifetime (e.g. `"12h"`, `"7d"`) |
+| `clients` | list | cond. | -- | At least one client for `api_key`/`either` mode |
 | `clients[].name` | string | yes | -- | Client identifier (appears in logs) |
 | `clients[].key` | string | yes | -- | API key for authentication (must be unique) |
 | `clients[].allow_models` | list | no | `[]` (deny all) | Models this client can access |
@@ -139,6 +163,16 @@ See [`butler.example.yaml`](butler.example.yaml) for a full annotated example.
 | `clients[].max_ctx` | int | no | `0` (no limit) | Max `num_ctx` value allowed |
 | `clients[].max_predict` | int | no | `0` (no limit) | Max `num_predict` value allowed |
 | `clients[].deny_prompt_patterns` | list | no | `[]` | Regex patterns; prompts matching any pattern are rejected |
+| `users` | list | cond. | -- | At least one user for `jwt_standalone` mode |
+| `users[].name` | string | yes | -- | Username for login and logs |
+| `users[].password_hash` | string | yes | -- | bcrypt hash of password |
+| `users[].allow_models` | list | no | `[]` (deny all) | Models this user can access |
+| `users[].deny_models` | list | no | `[]` | Models explicitly denied |
+| `users[].rate_limit` | string | no | -- | Per-user rate limit |
+| `users[].max_request_bytes` | int | no | `0` (no limit) | Max request body size in bytes |
+| `users[].max_ctx` | int | no | `0` (no limit) | Max `num_ctx` value allowed |
+| `users[].max_predict` | int | no | `0` (no limit) | Max `num_predict` value allowed |
+| `users[].deny_prompt_patterns` | list | no | `[]` | Regex patterns; prompts matching any pattern are rejected |
 
 ### Model matching rules
 
@@ -168,13 +202,28 @@ curl http://localhost:8080/api/tags \
   -H "Authorization: Bearer sk-my-api-key"
 ```
 
+### JWT authentication
+
+```bash
+# Login to get a JWT token
+curl -X POST http://localhost:8080/auth/login \
+  -d '{"username": "alice", "password": "hunter2"}'
+# Returns: {"token":"eyJ..."}
+
+# Use the token for requests
+curl http://localhost:8080/api/chat \
+  -H "Authorization: Bearer eyJ..." \
+  -d '{"model": "llama3.2", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
 ### Error responses
 
 All errors are returned as JSON:
 
 | Status | Body | Meaning |
 |---|---|---|
-| `401` | `{"error":"unauthorized"}` | Missing or invalid API key |
+| `401` | `{"error":"unauthorized"}` | Missing or invalid API key / JWT |
+| `401` | `{"error":"invalid credentials"}` | Wrong username or password (`/auth/login`) |
 | `403` | `{"error":"model not allowed"}` | Client not authorized for the requested model |
 | `403` | `{"error":"prompt rejected"}` | Prompt matches a denied pattern |
 | `400` | `{"error":"bad request"}` | Malformed request body |
@@ -199,7 +248,7 @@ Butler proxies all Ollama endpoints transparently. Model-level ACL is enforced o
 `/api/tags`, `/api/ps`, `/api/version`, `/v1/models`, and any other path
 
 **Unauthenticated** (no auth required):
-`/healthz` (health check with upstream connectivity), `/metrics` (Prometheus metrics)
+`/healthz` (health check with upstream connectivity), `/metrics` (Prometheus metrics), `/auth/login` (JWT login, returns 404 in api_key mode)
 
 ## Logging
 
@@ -248,17 +297,14 @@ make clean       # Remove the binary
 
 ```
 cmd/butler/main.go               Entry point
-internal/config/config.go        YAML config loading, validation, model ACL, rate specs
-internal/config/config_test.go   Config, ACL, Phase 2/3 field unit tests
+internal/auth/jwt.go             JWT issuance, validation, bcrypt password check
+internal/config/config.go        YAML config loading, validation, model ACL, rate specs, Subject
 internal/proxy/proxy.go          Reverse proxy, auth, rate limiting, input filtering, response logging
+internal/proxy/login.go          /auth/login POST handler
 internal/proxy/model.go          Request body inspection (model, prompts, num_ctx, num_predict)
 internal/proxy/ratelimit.go      Fixed-window rate limiter
 internal/proxy/metrics.go        Hand-rolled Prometheus metrics collector
 internal/proxy/health.go         /healthz health check handler
-internal/proxy/proxy_test.go     Proxy integration tests
-internal/proxy/metrics_test.go   Metrics unit tests
-internal/proxy/health_test.go    Health check unit tests
-internal/proxy/ratelimit_test.go Rate limiter unit tests
 ```
 
 ### Running tests

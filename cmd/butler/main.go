@@ -28,7 +28,9 @@ func main() {
 	logger.Info("config loaded",
 		"listen", cfg.Listen,
 		"upstream", cfg.Upstream,
+		"auth_mode", cfg.Auth.Mode,
 		"clients", len(cfg.Clients),
+		"users", len(cfg.Users),
 	)
 
 	p, err := proxy.New(cfg, logger)

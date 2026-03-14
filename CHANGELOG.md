@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- JWT standalone authentication (`auth.mode: jwt_standalone`) with built-in `/auth/login` endpoint
+- Per-user identity with configurable model ACLs, rate limits, context caps, and prompt filtering
+- `either` auth mode accepting both API keys and JWT tokens
+- `Subject` abstraction unifying Client and User policy enforcement
+- User identity (`"user"` field) in structured log output for JWT-authenticated requests
 - Prometheus-compatible `/metrics` endpoint with request counters, rejection counters, and latency histograms (hand-rolled, no external dependencies)
 - `/healthz` health check endpoint that verifies upstream Ollama connectivity
 - Optional full-prompt logging (`log_prompts: true`) for audit and debugging (disabled by default)

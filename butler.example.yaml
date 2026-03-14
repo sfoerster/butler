@@ -14,6 +14,31 @@ upstream: "http://127.0.0.1:11434"
 # Ensure your log pipeline handles PII appropriately.
 # log_prompts: false
 
+# Authentication mode: "api_key" (default), "jwt_standalone", or "either".
+# auth:
+#   mode: jwt_standalone
+#   jwt_secret: "${JWT_SECRET}"     # Must be ≥32 characters
+#   token_expiry: "24h"             # Default: 24h
+
+# Users for JWT authentication (jwt_standalone or either mode).
+# Generate bcrypt hashes with: htpasswd -nbBC 10 "" 'password' | cut -d: -f2
+# users:
+#   - name: alice
+#     password_hash: "$2b$10$..."   # bcrypt hash
+#     allow_models: ["*"]
+#     # deny_models: []
+#     # rate_limit: "60/min"
+#     # max_request_bytes: 1048576
+#     # max_ctx: 4096
+#     # max_predict: 512
+#     # deny_prompt_patterns:
+#     #   - "(?i)ignore.*instructions"
+#
+#   - name: kid1
+#     password_hash: "$2b$10$..."
+#     allow_models: ["llama3.2"]
+#     rate_limit: "20/hour"
+
 clients:
   - name: linkedin-copilot
     key: "${LINKEDIN_COPILOT_KEY}"
