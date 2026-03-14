@@ -25,18 +25,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("config loaded",
+	logAttrs := []any{
 		"listen", cfg.Listen,
 		"upstream", cfg.Upstream,
+		"auth_mode", cfg.Auth.Mode,
 		"clients", len(cfg.Clients),
-	)
+		"users", len(cfg.Users),
+	}
+	if cfg.Auth.OIDC != nil {
+		logAttrs = append(logAttrs, "oidc_issuer", cfg.Auth.OIDC.Issuer)
+	}
+	logger.Info("config loaded", logAttrs...)
 
 	p, err := proxy.New(cfg, logger)
 	if err != nil {
 		logger.Error("failed to create proxy", "error", err)
 		os.Exit(1)
 	}
-
 	logger.Info("starting butler", "listen", cfg.Listen)
 	server := &http.Server{
 		Addr:              cfg.Listen,
@@ -48,6 +53,7 @@ func main() {
 	}
 	if err := server.ListenAndServe(); err != nil {
 		logger.Error("server error", "error", err)
+		p.Close()
 		os.Exit(1)
 	}
 }

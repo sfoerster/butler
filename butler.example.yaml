@@ -5,10 +5,79 @@
 listen: "127.0.0.1:8080"
 upstream: "http://127.0.0.1:11434"
 
+# Global rate limit — applies across all clients combined.
+# Format: "<count>/min" or "<count>/hour"
+# global_rate_limit: "600/min"
+
+# Log full prompt content at INFO level.
+# WARNING: Enabling this will log all user prompts in plaintext.
+# Ensure your log pipeline handles PII appropriately.
+# log_prompts: false
+
+# Authentication mode: "api_key" (default), "jwt_standalone", "oidc", or "either".
+# auth:
+#   mode: jwt_standalone
+#   jwt_secret: "${JWT_SECRET}"     # Must be ≥32 characters
+#   token_expiry: "24h"             # Default: 24h
+
+# OIDC federation (for oidc or either mode).
+# Validates tokens issued by an external identity provider (Keycloak, Okta, Entra ID).
+# JWKS keys are fetched automatically via .well-known/openid-configuration.
+# auth:
+#   mode: oidc
+#   oidc:
+#     issuer: "https://auth.example.com/realms/default"   # Must be HTTPS
+#     client_id: "butler"
+#     role_claim_path: "realm_access.roles"                # Dot-separated path to roles in JWT claims
+#     # refresh_interval: "60m"                            # JWKS refresh interval (default: 60m)
+
+# Users for JWT authentication (jwt_standalone or either mode).
+# Generate bcrypt hashes with: htpasswd -nbBC 10 "" 'password' | cut -d: -f2
+# users:
+#   - name: alice
+#     password_hash: "$2b$10$..."   # bcrypt hash
+#     allow_models: ["*"]
+#     # deny_models: []
+#     # rate_limit: "60/min"
+#     # max_request_bytes: 1048576
+#     # max_ctx: 4096
+#     # max_predict: 512
+#     # deny_prompt_patterns:
+#     #   - "(?i)ignore.*instructions"
+#
+#   - name: kid1
+#     password_hash: "$2b$10$..."
+#     allow_models: ["llama3.2"]
+#     rate_limit: "20/hour"
+
+# Role policies for OIDC mode.
+# Maps OIDC roles to proxy policy. Users are managed in the IdP, not here.
+# role_policies:
+#   admin:
+#     allow_models: ["*"]
+#   operator:
+#     allow_models: ["*"]
+#     rate_limit: "120/hour"
+#   viewer:
+#     allow_models: ["llama3.2:1b"]
+#     rate_limit: "20/hour"
+#     max_ctx: 2048
+#     # max_request_bytes: 1048576
+#     # max_predict: 512
+#     # deny_prompt_patterns:
+#     #   - "(?i)ignore.*instructions"
+
 clients:
   - name: linkedin-copilot
     key: "${LINKEDIN_COPILOT_KEY}"
     allow_models: ["llama3.2", "mistral"]
+    # rate_limit: "60/min"           # Per-client rate limit
+    # max_request_bytes: 1048576     # Max request body size in bytes (0 = no limit)
+    # max_ctx: 4096                  # Max num_ctx value (0 = no limit)
+    # max_predict: 512               # Max num_predict value (0 = no limit)
+    # deny_prompt_patterns:          # Regex patterns to reject prompts
+    #   - "(?i)ignore.*instructions"
+    #   - "(?i)secret.*password"
 
   - name: open-webui
     key: "${OPEN_WEBUI_KEY}"
@@ -17,4 +86,7 @@ clients:
   - name: dev-sandbox
     key: "${DEV_SANDBOX_KEY}"
     allow_models: ["llama3.2:1b"]
+    rate_limit: "10/min"
+    max_ctx: 2048
+    max_predict: 256
     # deny_models: ["some-model"]  # optional denylist (checked before allowlist)

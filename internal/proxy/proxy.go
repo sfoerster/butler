@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sfoerster/butler/internal/auth"
 	"github.com/sfoerster/butler/internal/config"
 )
 
@@ -19,6 +20,10 @@ type Proxy struct {
 	config  *config.Config
 	reverse *httputil.ReverseProxy
 	logger  *slog.Logger
+	limiter *rateLimiter
+	metrics *metrics
+	jwt     *auth.JWTService
+	oidc    *auth.OIDCService
 }
 
 func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
@@ -28,8 +33,30 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	}
 
 	p := &Proxy{
-		config: cfg,
-		logger: logger,
+		config:  cfg,
+		logger:  logger,
+		limiter: newRateLimiter(),
+		metrics: newMetrics(),
+	}
+
+	if cfg.Auth.Mode == "jwt_standalone" || cfg.Auth.Mode == "either" {
+		if cfg.Auth.JWTSecret != "" {
+			p.jwt = auth.NewJWTService(cfg.Auth.JWTSecret, cfg.Auth.TokenExpiryDuration())
+		}
+	}
+
+	if (cfg.Auth.Mode == "oidc" || cfg.Auth.Mode == "either") && cfg.Auth.OIDC != nil {
+		oidcSvc, err := auth.NewOIDCService(
+			cfg.Auth.OIDC.Issuer,
+			cfg.Auth.OIDC.ClientID,
+			cfg.Auth.OIDC.RoleClaimPath,
+			cfg.Auth.OIDC.RefreshIntervalDuration(),
+			logger,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initializing OIDC: %w", err)
+		}
+		p.oidc = oidcSvc
 	}
 
 	p.reverse = &httputil.ReverseProxy{
@@ -49,78 +76,192 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	return p, nil
 }
 
+// Close stops background goroutines (e.g., OIDC JWKS refresh).
+func (p *Proxy) Close() {
+	if p.oidc != nil {
+		p.oidc.Stop()
+	}
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	// Authenticate
-	client := p.authenticate(r)
-	if client == nil {
+	// Unauthenticated endpoints
+	switch r.URL.Path {
+	case "/healthz":
+		p.handleHealthz(w, r)
+		return
+	case "/metrics":
+		p.metrics.Handler().ServeHTTP(w, r)
+		return
+	case "/auth/login":
+		p.handleLogin(w, r)
+		return
+	}
+
+	// 1. Authenticate
+	subj := p.authenticate(r)
+	if subj == nil {
 		p.logger.Warn("unauthorized request",
 			"path", r.URL.Path,
 			"remote", r.RemoteAddr,
 		)
+		p.metrics.RecordRejection("", "unauthorized")
 		writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
 		return
 	}
 
-	// Extract model from request body (if applicable)
-	model, body, err := extractModel(r)
+	// 2. Global rate limit
+	if !p.limiter.Allow("__global__", p.config.GlobalRate()) {
+		p.logger.Warn("global rate limit exceeded",
+			"client", subj.Name,
+			"path", r.URL.Path,
+		)
+		p.metrics.RecordRejection(subj.Name, "rate_limited")
+		writeJSON(w, http.StatusTooManyRequests, `{"error":"rate limit exceeded"}`)
+		return
+	}
+
+	// 3. Per-subject rate limit
+	if !p.limiter.Allow(subj.RateLimitKey(), subj.Rate) {
+		p.logger.Warn("client rate limit exceeded",
+			"client", subj.Name,
+			"path", r.URL.Path,
+		)
+		p.metrics.RecordRejection(subj.Name, "rate_limited")
+		writeJSON(w, http.StatusTooManyRequests, `{"error":"rate limit exceeded"}`)
+		return
+	}
+
+	// 4. Body inspection
+	info, err := inspectRequest(r, subj.MaxReqBytes)
 	if err != nil {
 		status := http.StatusBadRequest
 		resp := `{"error":"bad request"}`
+		reason := "too_large"
 		if errors.Is(err, errBodyTooLarge) {
 			status = http.StatusRequestEntityTooLarge
 			resp = `{"error":"request body too large"}`
 		}
+		if errors.Is(err, errRequestTooLarge) {
+			status = http.StatusRequestEntityTooLarge
+			resp = `{"error":"request too large"}`
+		}
 		p.logger.Error("failed to read request body",
 			"error", err,
-			"client", client.Name,
+			"client", subj.Name,
 		)
+		p.metrics.RecordRejection(subj.Name, reason)
 		writeJSON(w, status, resp)
 		return
 	}
 
-	// Restore body for proxying
-	if body != nil {
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r.ContentLength = int64(len(body))
+	var model string
+	if info != nil {
+		model = info.Model
+
+		// 5. Restore body for proxying
+		r.Body = io.NopCloser(bytes.NewReader(info.Body))
+		r.ContentLength = int64(len(info.Body))
 	}
 
-	// ACL check
-	if model != "" && !client.ModelAllowed(model) {
+	// 6. Model ACL
+	if model != "" && !subj.ModelAllowed(model) {
 		p.logger.Warn("model denied",
-			"client", client.Name,
+			"client", subj.Name,
 			"model", model,
 			"path", r.URL.Path,
 		)
+		p.metrics.RecordRejection(subj.Name, "model_denied")
 		writeJSON(w, http.StatusForbidden, `{"error":"model not allowed"}`)
 		return
 	}
 
-	p.logger.Info("request",
-		"client", client.Name,
+	// 7. num_ctx cap
+	if info != nil && subj.MaxCtx > 0 && info.NumCtx > subj.MaxCtx {
+		p.logger.Warn("num_ctx exceeds limit",
+			"client", subj.Name,
+			"num_ctx", info.NumCtx,
+			"limit", subj.MaxCtx,
+		)
+		p.metrics.RecordRejection(subj.Name, "num_ctx_exceeded")
+		writeJSON(w, http.StatusBadRequest,
+			fmt.Sprintf(`{"error":"num_ctx %d exceeds limit of %d"}`, info.NumCtx, subj.MaxCtx))
+		return
+	}
+
+	// 8. num_predict cap
+	if info != nil && subj.MaxPredict > 0 && info.NumPredict > subj.MaxPredict {
+		p.logger.Warn("num_predict exceeds limit",
+			"client", subj.Name,
+			"num_predict", info.NumPredict,
+			"limit", subj.MaxPredict,
+		)
+		p.metrics.RecordRejection(subj.Name, "num_predict_exceeded")
+		writeJSON(w, http.StatusBadRequest,
+			fmt.Sprintf(`{"error":"num_predict %d exceeds limit of %d"}`, info.NumPredict, subj.MaxPredict))
+		return
+	}
+
+	// 9. Prompt pattern rejection
+	if info != nil && len(subj.DenyPatterns) > 0 {
+		for _, re := range subj.DenyPatterns {
+			for _, prompt := range info.Prompts {
+				if re.MatchString(prompt) {
+					p.logger.Warn("prompt rejected",
+						"client", subj.Name,
+						"pattern", re.String(),
+						"path", r.URL.Path,
+					)
+					p.metrics.RecordRejection(subj.Name, "prompt_rejected")
+					writeJSON(w, http.StatusForbidden, `{"error":"prompt rejected"}`)
+					return
+				}
+			}
+		}
+	}
+
+	// 10. Log + proxy + response log
+	logAttrs := []any{
+		"client", subj.Name,
 		"model", model,
 		"method", r.Method,
 		"path", r.URL.Path,
 		"remote", r.RemoteAddr,
-	)
+	}
+	if subj.AuthSource == "jwt" || subj.AuthSource == "oidc" {
+		logAttrs = append(logAttrs, "user", subj.Name)
+	}
+	p.logger.Info("request", logAttrs...)
 
-	// Wrap response writer to capture status code
+	// Optional prompt logging
+	if p.config.LogPrompts && info != nil && len(info.Prompts) > 0 {
+		p.logger.Info("prompts",
+			"client", subj.Name,
+			"model", model,
+			"path", r.URL.Path,
+			"prompts", info.Prompts,
+		)
+	}
+
 	wrapped := &statusWriter{ResponseWriter: w}
 	p.reverse.ServeHTTP(wrapped, r)
 
+	duration := time.Since(start)
 	p.logger.Info("response",
-		"client", client.Name,
+		"client", subj.Name,
 		"model", model,
 		"path", r.URL.Path,
 		"status", wrapped.code,
-		"duration_ms", time.Since(start).Milliseconds(),
+		"duration_ms", duration.Milliseconds(),
 	)
+
+	p.metrics.RecordRequest(subj.Name, model, r.URL.Path, wrapped.code, duration)
 }
 
-func (p *Proxy) authenticate(r *http.Request) *config.Client {
-	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	scheme, token, ok := strings.Cut(auth, " ")
+func (p *Proxy) authenticate(r *http.Request) *config.Subject {
+	hdr := strings.TrimSpace(r.Header.Get("Authorization"))
+	scheme, token, ok := strings.Cut(hdr, " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") {
 		return nil
 	}
@@ -128,7 +269,56 @@ func (p *Proxy) authenticate(r *http.Request) *config.Client {
 	if key == "" {
 		return nil
 	}
-	return p.config.ClientByKey(key)
+
+	mode := p.config.Auth.Mode
+	if mode == "" {
+		mode = "api_key"
+	}
+
+	// Try API key lookup
+	if mode == "api_key" || mode == "either" {
+		if client := p.config.ClientByKey(key); client != nil {
+			return client.Subject()
+		}
+		if mode == "api_key" {
+			return nil
+		}
+	}
+
+	// Try JWT validation
+	if mode == "jwt_standalone" || mode == "either" {
+		if p.jwt != nil {
+			username, err := p.jwt.Validate(key)
+			if err == nil {
+				user := p.config.UserByName(username)
+				if user != nil {
+					return user.Subject()
+				}
+			}
+			if mode == "jwt_standalone" {
+				return nil
+			}
+		}
+	}
+
+	// Try OIDC validation
+	if mode == "oidc" || mode == "either" {
+		if p.oidc != nil {
+			claims, err := p.oidc.Validate(key)
+			if err == nil {
+				name := claims.PreferredUsername
+				if name == "" {
+					name = claims.Subject
+				}
+				subj := p.config.SubjectFromRoles(name, claims.Roles)
+				if subj != nil {
+					return subj
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // statusWriter wraps http.ResponseWriter to capture the status code.
