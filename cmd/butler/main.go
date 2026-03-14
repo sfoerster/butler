@@ -42,8 +42,6 @@ func main() {
 		logger.Error("failed to create proxy", "error", err)
 		os.Exit(1)
 	}
-	defer p.Close()
-
 	logger.Info("starting butler", "listen", cfg.Listen)
 	server := &http.Server{
 		Addr:              cfg.Listen,
