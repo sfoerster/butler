@@ -934,8 +934,9 @@ role_policies:
 	if cfg.Auth.OIDC == nil {
 		t.Fatal("OIDC config should be present")
 	}
+	// No jwt_secret required when only OIDC + API keys
 	if cfg.Auth.JWTSecret != "" {
-		// No jwt_secret required when only OIDC + API keys
+		t.Errorf("JWTSecret = %q, want empty", cfg.Auth.JWTSecret)
 	}
 }
 

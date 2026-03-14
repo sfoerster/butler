@@ -138,7 +138,7 @@ func (s *OIDCService) fetchDiscovery() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrOIDCProviderUnreachable, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("%w: discovery returned %d", ErrOIDCProviderUnreachable, resp.StatusCode)
@@ -185,7 +185,7 @@ func (s *OIDCService) refreshJWKS() error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrOIDCProviderUnreachable, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%w: JWKS returned %d", ErrOIDCProviderUnreachable, resp.StatusCode)
@@ -287,8 +287,7 @@ func parseECKey(k jwkKey) (*ecdsa.PublicKey, error) {
 
 func (s *OIDCService) keyFunc(token *jwt.Token) (interface{}, error) {
 	// Reject HMAC and none algorithms
-	switch token.Method.(type) {
-	case *jwt.SigningMethodHMAC:
+	if _, ok := token.Method.(*jwt.SigningMethodHMAC); ok {
 		return nil, ErrOIDCInvalidToken
 	}
 	if token.Method.Alg() == "none" {

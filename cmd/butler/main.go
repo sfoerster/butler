@@ -55,6 +55,7 @@ func main() {
 	}
 	if err := server.ListenAndServe(); err != nil {
 		logger.Error("server error", "error", err)
+		p.Close()
 		os.Exit(1)
 	}
 }

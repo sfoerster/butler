@@ -24,7 +24,7 @@ func (p *Proxy) handleHealthz(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf(`{"status":"unhealthy","error":"%s"}`, "upstream unreachable"))
 		return
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		writeJSON(w, http.StatusServiceUnavailable,
