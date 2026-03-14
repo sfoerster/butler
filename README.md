@@ -34,6 +34,9 @@ Butler gives you per-client API keys, model-level allowlists and denylists, rate
 - **Context length cap** -- reject requests with `num_ctx` above a per-client threshold
 - **Token prediction cap** -- enforce a `num_predict` ceiling per client
 - **Regex prompt rejection** -- block requests matching configurable patterns before they reach the model
+- **Prometheus metrics** -- `/metrics` endpoint with request counters, rejection counters, and latency histograms (hand-rolled, no external dependencies)
+- **Health check** -- `/healthz` endpoint that verifies upstream Ollama connectivity (for load balancers and orchestrators)
+- **Optional prompt logging** -- log full prompt content at INFO level for audit and debugging (`log_prompts: true`)
 - **Structured JSON logging** -- every request and response is logged with client identity, model, HTTP method, path, status code, and duration
 - **YAML configuration** with `${ENV_VAR}` interpolation for secrets
 - **Single static binary** -- no runtime dependencies, no database, no Redis
@@ -90,6 +93,7 @@ Butler is configured with a single YAML file. Secrets can be referenced as `${EN
 listen: "127.0.0.1:8080"        # Address to listen on (default: 127.0.0.1:8080)
 upstream: "http://127.0.0.1:11434"  # Ollama address (required)
 global_rate_limit: "600/min"     # Global rate limit across all clients (optional)
+log_prompts: false               # Log full prompts at INFO level (default: false)
 
 clients:
   - name: my-app                 # Human-readable client name (for logs)
@@ -124,6 +128,7 @@ See [`butler.example.yaml`](butler.example.yaml) for a full annotated example.
 | `listen` | string | no | `127.0.0.1:8080` | Address and port to listen on |
 | `upstream` | string | yes | -- | Ollama server URL |
 | `global_rate_limit` | string | no | -- | Rate limit across all clients (e.g. `"600/min"`, `"1000/hour"`) |
+| `log_prompts` | bool | no | `false` | Log full prompt content at INFO level (privacy-sensitive) |
 | `clients` | list | yes | -- | At least one client must be defined |
 | `clients[].name` | string | yes | -- | Client identifier (appears in logs) |
 | `clients[].key` | string | yes | -- | API key for authentication (must be unique) |
@@ -193,6 +198,9 @@ Butler proxies all Ollama endpoints transparently. Model-level ACL is enforced o
 **Passthrough** (auth only, no model check):
 `/api/tags`, `/api/ps`, `/api/version`, `/v1/models`, and any other path
 
+**Unauthenticated** (no auth required):
+`/healthz` (health check with upstream connectivity), `/metrics` (Prometheus metrics)
+
 ## Logging
 
 Butler emits structured JSON logs to stdout ([12-factor](https://12factor.net/logs) style). Every proxied request produces two log lines -- one on entry and one on completion:
@@ -211,7 +219,13 @@ Denied requests are logged at `WARN` level:
 {"time":"2025-03-05T10:30:08Z","level":"WARN","msg":"prompt rejected","client":"dev-sandbox","pattern":"(?i)ignore.*instructions","path":"/api/generate"}
 ```
 
-Pipe logs to any collector that accepts JSON lines (journald, Loki, Datadog, etc.).
+When `log_prompts: true` is set, Butler also logs the full prompt content at INFO level:
+
+```json
+{"time":"2025-03-05T10:30:00Z","level":"INFO","msg":"prompts","client":"my-app","model":"llama3.2","path":"/api/chat","prompts":["Hello, how are you?"]}
+```
+
+Butler logs to stdout. Log rotation is the responsibility of your log collector (journald, Loki, Datadog, logrotate, etc.).
 
 ## Development
 
@@ -233,13 +247,17 @@ make clean       # Remove the binary
 ### Project structure
 
 ```
-cmd/butler/main.go              Entry point
-internal/config/config.go       YAML config loading, validation, model ACL, rate specs
-internal/config/config_test.go  Config, ACL, and Phase 2 field unit tests
-internal/proxy/proxy.go         Reverse proxy, auth, rate limiting, input filtering, response logging
-internal/proxy/model.go         Request body inspection (model, prompts, num_ctx, num_predict)
-internal/proxy/ratelimit.go     Fixed-window rate limiter
-internal/proxy/proxy_test.go    Proxy integration tests
+cmd/butler/main.go               Entry point
+internal/config/config.go        YAML config loading, validation, model ACL, rate specs
+internal/config/config_test.go   Config, ACL, Phase 2/3 field unit tests
+internal/proxy/proxy.go          Reverse proxy, auth, rate limiting, input filtering, response logging
+internal/proxy/model.go          Request body inspection (model, prompts, num_ctx, num_predict)
+internal/proxy/ratelimit.go      Fixed-window rate limiter
+internal/proxy/metrics.go        Hand-rolled Prometheus metrics collector
+internal/proxy/health.go         /healthz health check handler
+internal/proxy/proxy_test.go     Proxy integration tests
+internal/proxy/metrics_test.go   Metrics unit tests
+internal/proxy/health_test.go    Health check unit tests
 internal/proxy/ratelimit_test.go Rate limiter unit tests
 ```
 
@@ -271,7 +289,6 @@ The `.gitlab-ci.yml` pipeline runs three stages:
 
 See [`docs/BUTLER_ROADMAP.md`](docs/BUTLER_ROADMAP.md) for the full roadmap. Upcoming phases:
 
-- **Phase 3** -- Observability (Prometheus `/metrics`, `/healthz` health check, optional full-prompt logging)
 - **Phase 4** -- Multi-user identity (JWT auth, OIDC federation, per-user policy and token budgets)
 - **Phase 5** -- Advanced policy (time-of-day restrictions, config hot-reload, mTLS, webhook notifications)
 

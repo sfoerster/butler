@@ -9,6 +9,11 @@ upstream: "http://127.0.0.1:11434"
 # Format: "<count>/min" or "<count>/hour"
 # global_rate_limit: "600/min"
 
+# Log full prompt content at INFO level.
+# WARNING: Enabling this will log all user prompts in plaintext.
+# Ensure your log pipeline handles PII appropriately.
+# log_prompts: false
+
 clients:
   - name: linkedin-copilot
     key: "${LINKEDIN_COPILOT_KEY}"

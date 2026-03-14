@@ -25,6 +25,10 @@ Security-sensitive components include:
 6. **Reverse proxy transport** -- upstream request forwarding, header handling, and response streaming (`internal/proxy/proxy.go`).
 7. **Configuration loading** -- YAML parsing and `${ENV_VAR}` interpolation of secrets (`internal/config/config.go`).
 
+## Unauthenticated Endpoints
+
+The `/healthz` and `/metrics` endpoints do not require authentication. They are intended for use by load balancers, orchestrators, and monitoring systems. If your deployment requires these to be restricted, place Butler behind a reverse proxy that limits access to these paths.
+
 ## Hardening Expectations
 
 1. Butler fails closed -- unauthenticated or unauthorized requests are rejected, never proxied.

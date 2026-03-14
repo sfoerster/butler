@@ -44,6 +44,7 @@ type Config struct {
 	Listen          string   `yaml:"listen"`
 	Upstream        string   `yaml:"upstream"`
 	GlobalRateLimit string   `yaml:"global_rate_limit"`
+	LogPrompts      bool     `yaml:"log_prompts"`
 	Clients         []Client `yaml:"clients"`
 	globalRate      *RateSpec
 }

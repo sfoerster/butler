@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Prometheus-compatible `/metrics` endpoint with request counters, rejection counters, and latency histograms (hand-rolled, no external dependencies)
+- `/healthz` health check endpoint that verifies upstream Ollama connectivity
+- Optional full-prompt logging (`log_prompts: true`) for audit and debugging (disabled by default)
 - Per-client rate limiting (`rate_limit` field, e.g. `"60/min"` or `"100/hour"`)
 - Global rate limiting (`global_rate_limit` field) to protect Ollama from total overload
 - Regex-based prompt rejection (`deny_prompt_patterns`) to block requests matching configurable patterns

@@ -976,6 +976,236 @@ func TestRateLimitDoesNotBreakStreaming(t *testing.T) {
 	}
 }
 
+// --- Phase 3 proxy integration tests ---
+
+func TestHealthzHealthy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/version" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/healthz", nil)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if !strings.Contains(w.Body.String(), `"status":"ok"`) {
+		t.Errorf("body = %q, want ok", w.Body.String())
+	}
+}
+
+func TestHealthzUnhealthy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	upstreamURL := upstream.URL
+	upstream.Close()
+
+	cfg := &config.Config{
+		Listen:   "127.0.0.1:0",
+		Upstream: upstreamURL,
+		Clients:  []config.Client{{Name: "test", Key: "sk-test", AllowModels: []string{"*"}}},
+	}
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	p, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/healthz", nil)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestHealthzNoAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream)
+
+	// No Authorization header — should still work
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/healthz", nil)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (healthz should not require auth)", w.Code, http.StatusOK)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream)
+
+	// Make a normal request first
+	w := httptest.NewRecorder()
+	body := `{"model":"llama3.2","prompt":"hi"}`
+	r := httptest.NewRequest("POST", "/api/generate", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer sk-allowed")
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("setup request: status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	// Now check /metrics
+	w = httptest.NewRecorder()
+	r = httptest.NewRequest("GET", "/metrics", nil)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("metrics status = %d, want %d", w.Code, http.StatusOK)
+	}
+	metricsBody := w.Body.String()
+	if !strings.Contains(metricsBody, "butler_requests_total") {
+		t.Error("metrics output missing butler_requests_total")
+	}
+	if !strings.Contains(metricsBody, `client="allowed-client"`) {
+		t.Errorf("metrics output missing client label, body:\n%s", metricsBody)
+	}
+	if !strings.Contains(metricsBody, `model="llama3.2"`) {
+		t.Errorf("metrics output missing model label, body:\n%s", metricsBody)
+	}
+	if !strings.Contains(metricsBody, "butler_request_duration_seconds") {
+		t.Error("metrics output missing histogram")
+	}
+}
+
+func TestMetricsNoAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream)
+
+	// No Authorization header — should still work
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/metrics", nil)
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (metrics should not require auth)", w.Code, http.StatusOK)
+	}
+}
+
+func TestMetricsRejectionTracking(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be reached")
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream)
+
+	// Make an unauthorized request
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/tags", nil)
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+
+	// Check metrics
+	w = httptest.NewRecorder()
+	r = httptest.NewRequest("GET", "/metrics", nil)
+	p.ServeHTTP(w, r)
+
+	metricsBody := w.Body.String()
+	if !strings.Contains(metricsBody, `reason="unauthorized"`) {
+		t.Errorf("metrics missing unauthorized rejection, body:\n%s", metricsBody)
+	}
+}
+
+func TestLogPrompts(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	var buf bytes.Buffer
+	cfg := &config.Config{
+		Listen:     "127.0.0.1:0",
+		Upstream:   upstream.URL,
+		LogPrompts: true,
+		Clients: []config.Client{
+			{Name: "log-client", Key: "sk-log", AllowModels: []string{"*"}},
+		},
+	}
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	p, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"llama3.2","messages":[{"role":"user","content":"tell me a secret"}]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/chat", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer sk-log")
+	p.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, `"msg":"prompts"`) {
+		t.Errorf("log output missing prompts message, got:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "tell me a secret") {
+		t.Errorf("log output missing prompt content, got:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, `"client":"log-client"`) {
+		t.Errorf("log output missing client name, got:\n%s", logOutput)
+	}
+}
+
+func TestLogPromptsDisabled(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	var buf bytes.Buffer
+	cfg := &config.Config{
+		Listen:     "127.0.0.1:0",
+		Upstream:   upstream.URL,
+		LogPrompts: false,
+		Clients: []config.Client{
+			{Name: "log-client", Key: "sk-log", AllowModels: []string{"*"}},
+		},
+	}
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	p, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"llama3.2","messages":[{"role":"user","content":"tell me a secret"}]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/chat", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer sk-log")
+	p.ServeHTTP(w, r)
+
+	logOutput := buf.String()
+	if strings.Contains(logOutput, `"msg":"prompts"`) {
+		t.Errorf("prompts should not be logged when disabled, got:\n%s", logOutput)
+	}
+}
+
 func TestMaxRequestBytesContentLengthFastPath(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("upstream should not be reached")

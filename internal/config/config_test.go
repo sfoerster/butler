@@ -227,6 +227,53 @@ clients:
 	}
 }
 
+func TestLoadWithPhase3Fields(t *testing.T) {
+	yaml := `
+upstream: "http://localhost:11434"
+log_prompts: true
+clients:
+  - name: test-client
+    key: "sk-test"
+    allow_models: ["*"]
+`
+	path := filepath.Join(t.TempDir(), "butler.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !cfg.LogPrompts {
+		t.Error("LogPrompts = false, want true")
+	}
+}
+
+func TestLoadWithPhase3FieldsDefault(t *testing.T) {
+	yaml := `
+upstream: "http://localhost:11434"
+clients:
+  - name: test-client
+    key: "sk-test"
+    allow_models: ["*"]
+`
+	path := filepath.Join(t.TempDir(), "butler.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.LogPrompts {
+		t.Error("LogPrompts = true, want false (default)")
+	}
+}
+
 func TestLoadEnvExpansion(t *testing.T) {
 	t.Setenv("TEST_KEY", "sk-from-env")
 

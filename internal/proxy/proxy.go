@@ -20,6 +20,7 @@ type Proxy struct {
 	reverse *httputil.ReverseProxy
 	logger  *slog.Logger
 	limiter *rateLimiter
+	metrics *metrics
 }
 
 func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
@@ -32,6 +33,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 		config:  cfg,
 		logger:  logger,
 		limiter: newRateLimiter(),
+		metrics: newMetrics(),
 	}
 
 	p.reverse = &httputil.ReverseProxy{
@@ -54,6 +56,16 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
+	// Unauthenticated endpoints
+	switch r.URL.Path {
+	case "/healthz":
+		p.handleHealthz(w, r)
+		return
+	case "/metrics":
+		p.metrics.Handler().ServeHTTP(w, r)
+		return
+	}
+
 	// 1. Authenticate
 	client := p.authenticate(r)
 	if client == nil {
@@ -61,6 +73,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"path", r.URL.Path,
 			"remote", r.RemoteAddr,
 		)
+		p.metrics.RecordRejection("", "unauthorized")
 		writeJSON(w, http.StatusUnauthorized, `{"error":"unauthorized"}`)
 		return
 	}
@@ -71,6 +84,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"client", client.Name,
 			"path", r.URL.Path,
 		)
+		p.metrics.RecordRejection(client.Name, "rate_limited")
 		writeJSON(w, http.StatusTooManyRequests, `{"error":"rate limit exceeded"}`)
 		return
 	}
@@ -81,6 +95,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"client", client.Name,
 			"path", r.URL.Path,
 		)
+		p.metrics.RecordRejection(client.Name, "rate_limited")
 		writeJSON(w, http.StatusTooManyRequests, `{"error":"rate limit exceeded"}`)
 		return
 	}
@@ -90,6 +105,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		status := http.StatusBadRequest
 		resp := `{"error":"bad request"}`
+		reason := "too_large"
 		if errors.Is(err, errBodyTooLarge) {
 			status = http.StatusRequestEntityTooLarge
 			resp = `{"error":"request body too large"}`
@@ -102,6 +118,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"error", err,
 			"client", client.Name,
 		)
+		p.metrics.RecordRejection(client.Name, reason)
 		writeJSON(w, status, resp)
 		return
 	}
@@ -122,6 +139,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"model", model,
 			"path", r.URL.Path,
 		)
+		p.metrics.RecordRejection(client.Name, "model_denied")
 		writeJSON(w, http.StatusForbidden, `{"error":"model not allowed"}`)
 		return
 	}
@@ -133,6 +151,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"num_ctx", info.NumCtx,
 			"limit", client.MaxCtx,
 		)
+		p.metrics.RecordRejection(client.Name, "num_ctx_exceeded")
 		writeJSON(w, http.StatusBadRequest,
 			fmt.Sprintf(`{"error":"num_ctx %d exceeds limit of %d"}`, info.NumCtx, client.MaxCtx))
 		return
@@ -145,6 +164,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"num_predict", info.NumPredict,
 			"limit", client.MaxPredict,
 		)
+		p.metrics.RecordRejection(client.Name, "num_predict_exceeded")
 		writeJSON(w, http.StatusBadRequest,
 			fmt.Sprintf(`{"error":"num_predict %d exceeds limit of %d"}`, info.NumPredict, client.MaxPredict))
 		return
@@ -160,6 +180,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						"pattern", re.String(),
 						"path", r.URL.Path,
 					)
+					p.metrics.RecordRejection(client.Name, "prompt_rejected")
 					writeJSON(w, http.StatusForbidden, `{"error":"prompt rejected"}`)
 					return
 				}
@@ -176,16 +197,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"remote", r.RemoteAddr,
 	)
 
+	// Optional prompt logging
+	if p.config.LogPrompts && info != nil && len(info.Prompts) > 0 {
+		p.logger.Info("prompts",
+			"client", client.Name,
+			"model", model,
+			"path", r.URL.Path,
+			"prompts", info.Prompts,
+		)
+	}
+
 	wrapped := &statusWriter{ResponseWriter: w}
 	p.reverse.ServeHTTP(wrapped, r)
 
+	duration := time.Since(start)
 	p.logger.Info("response",
 		"client", client.Name,
 		"model", model,
 		"path", r.URL.Path,
 		"status", wrapped.code,
-		"duration_ms", time.Since(start).Milliseconds(),
+		"duration_ms", duration.Milliseconds(),
 	)
+
+	p.metrics.RecordRequest(client.Name, model, r.URL.Path, wrapped.code, duration)
 }
 
 func (p *Proxy) authenticate(r *http.Request) *config.Client {

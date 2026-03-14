@@ -76,10 +76,10 @@ clients:
 
 ### Phase 3 — Observability
 
-- [ ] Prometheus metrics endpoint (`/metrics`) — request count, latency histogram, tokens generated, per-model and per-client breakdowns
-- [ ] Health check endpoint (`/healthz`) that also checks upstream Ollama connectivity
-- [ ] Optional request body logging (full prompts) with a separate config flag and privacy warning
-- [ ] Log rotation / structured log output compatible with journald, Loki, etc.
+- [x] Prometheus metrics endpoint (`/metrics`) — request count, rejection count, latency histogram, per-model and per-client breakdowns
+- [x] Health check endpoint (`/healthz`) that also checks upstream Ollama connectivity
+- [x] Optional request body logging (full prompts) with a separate config flag (`log_prompts`) and privacy warning
+- [x] Log rotation (docs — Butler logs to stdout, rotation is the collector's job)
 
 ### Phase 4 — Multi-User Identity and Context Isolation
 
