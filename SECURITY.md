@@ -4,7 +4,7 @@
 
 Do not open public issues for suspected vulnerabilities.
 
-Email sfoerster@gmail.com with the subject line `[Butler Security]` and include:
+Email `cve@stormblest.com` with the subject line `[Butler Security]` and include:
 
 1. A clear description of the issue and impact.
 2. Reproduction steps or a minimal proof of concept.
